@@ -1,6 +1,6 @@
 # Input Specification
 
-This document provides a complete reference for all inputs accepted by `ABCD_fmri_orchestration_S3`. It covers every configuration field, input file format, validation rule, and output schema. For a high-level overview and usage guide, see [README.md](README.md).
+This document provides a complete reference for all inputs accepted by `ABCD_fmri_orchestrator_S3`. It covers every configuration field, input file format, validation rule, and output schema. For a high-level overview and usage guide, see [README.md](README.md).
 
 ## 1. Overview of Inputs
 
