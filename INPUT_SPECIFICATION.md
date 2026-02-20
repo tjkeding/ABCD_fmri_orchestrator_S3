@@ -332,26 +332,27 @@ BIDS-format task events files, downloaded from the mmps_mproc location on S3.
 
 ### N-Back Specific Behavior
 
-When `fix_nback_cues: true` is set for a task, the orchestrator relabels generic "cue" (or "Cue") trial types. The ABCD n-back task has this structure:
+When `fix_nback_cues: true` is set for a task, the orchestrator relabels generic "cue" (or "Cue") trial types based on the n-back level of the subsequent block. The ABCD n-back task has this structure:
 
 ```
 onset     duration  trial_type
 0.000     6.400     "dummy"
-6.410     2.890     "cue"          ← relabeled to "posface"
+6.410     2.890     "cue"          ← relabeled to "posface" (0-back: passive viewing)
 9.410     1.900     "0_back_posface"
 11.910    1.900     "0_back_posface"
 ...
-34.470    2.890     "cue"          ← relabeled to "place"
+34.470    2.890     "cue"          ← relabeled to "instruction" (2-back: instruction screen)
 37.470    1.900     "2_back_place"
 ```
 
 The relabeling algorithm:
 1. For each row where the condition is "cue" or "Cue"
 2. Look ahead to find the next row matching the pattern `{digit}_back_{condition}`
-3. Extract the `{condition}` portion (e.g., "posface", "place", "neutface", "negface")
-4. Replace the cue's trial type with the extracted condition
+3. Extract the n-back level (`0` or `2`) and the condition (e.g., "posface", "place")
+4. If the level is `0` (passive viewing): replace the cue's trial type with the bare condition name
+5. If the level is `2` (or any other non-zero level): replace the cue's trial type with `"instruction"`
 
-The n-back level prefix (`0_back_` / `2_back_`) is stripped from cue labels because the cue is a passive viewing event — the n-back manipulation only applies to subsequent recall trials.
+This distinction matters because 0-back cues are passive viewing events where the subject sees the target stimulus, while 2-back cues are instruction screens that tell the subject to begin the recall task. The "instruction" condition is included in `cond_labels` for `task_act` analyses (modeled as a standard regressor) but is not referenced in any contrast — it is modeled to account for the variance but not tested.
 
 ### Onset Adjustment
 

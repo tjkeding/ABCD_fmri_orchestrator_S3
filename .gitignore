@@ -14,3 +14,5 @@ first_level_todo.txt
 fmriprep_confounds_file_example.tsv
 raw_events_file_example.tsv
 raw_motion_file_example.tsv
+orch_config_final.yaml
+proc_config_final.yaml

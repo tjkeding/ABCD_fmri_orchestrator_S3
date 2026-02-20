@@ -1082,13 +1082,16 @@ def fix_nback_cue_labels(events_path, condition_column, out_path, logger):
     "cue" (or "Cue") trial_type. The actual stimulus condition shown during
     the cue is only identifiable from the block of trials that follows it
     (e.g. "0_back_posface", "2_back_place"). This function replaces each
-    cue's trial_type with the condition portion of the next non-cue trial
-    (e.g. "posface", "place", "neutface", "negface").
+    cue's trial_type based on the n-back level of the following block:
 
-    The n-back level prefix ({0/2}_back_) is stripped because the cue trial
-    itself is a passive viewing event — the subject simply views the stimulus.
-    The n-back manipulation (0-back vs 2-back recall) only applies to the
-    subsequent recall trials, whose labels are left unchanged.
+    - **0-back cues** are passive viewing events where the subject sees the
+      target stimulus. These are relabeled with the bare condition name
+      (e.g. "posface", "place", "neutface", "negface").
+    - **2-back cues** are instruction screens that tell the subject to begin
+      the 2-back recall task. These are relabeled as "instruction".
+
+    The subsequent recall trials (e.g. "0_back_posface", "2_back_place")
+    are left unchanged.
 
     Parameters
     ----------
@@ -1122,38 +1125,50 @@ def fix_nback_cue_labels(events_path, condition_column, out_path, logger):
             f"Available columns: {list(events_df.columns)}"
         )
 
-    # Pattern to extract the condition from trial types like "0_back_posface"
-    nback_pattern = re.compile(r"^\d+_back_(.+)$")
+    # Pattern to extract n-back level and condition from trial types like "0_back_posface"
+    nback_pattern = re.compile(r"^(\d+)_back_(.+)$")
 
     n_relabeled = 0
+    n_instruction = 0
     for i in range(len(events_df)):
         trial_type = str(events_df.at[i, condition_column]).strip().strip('"')
         if trial_type.lower() != "cue":
             continue
 
         # Look ahead for the first non-cue, non-dummy trial to infer condition
-        condition = None
+        match = None
         for j in range(i + 1, len(events_df)):
             next_type = str(events_df.at[j, condition_column]).strip().strip('"')
             match = nback_pattern.match(next_type)
             if match:
-                condition = match.group(1)
                 break
 
-        if condition is None:
+        if match is None:
             raise OrchestratorError(
                 f"Cannot determine cue condition for row {i} in {events_path}: "
                 f"no subsequent n-back trial found after cue at onset "
                 f"{events_df.at[i, 'onset']}."
             )
 
-        events_df.at[i, condition_column] = condition
+        level = match.group(1)      # "0" or "2"
+        condition = match.group(2)  # "posface", "place", etc.
+
+        if level == "0":
+            # 0-back cues are passive viewing — label with bare condition
+            events_df.at[i, condition_column] = condition
+        else:
+            # 2-back (and any other level) cues are instruction screens
+            events_df.at[i, condition_column] = "instruction"
+            n_instruction += 1
+
         n_relabeled += 1
 
     events_df.to_csv(out_path, sep="\t", index=False)
     logger.info(
-        "Relabeled %d cue trial(s) in n-back events file: %s → %s",
-        n_relabeled, os.path.basename(events_path), os.path.basename(out_path)
+        "Relabeled %d cue trial(s) (%d as stimulus conditions, %d as 'instruction') "
+        "in n-back events file: %s → %s",
+        n_relabeled, n_relabeled - n_instruction, n_instruction,
+        os.path.basename(events_path), os.path.basename(out_path)
     )
     return out_path
 
