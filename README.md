@@ -54,12 +54,12 @@ run_orchestrator.py
 
 ```bash
 # Clone the repository
-git clone https://github.com/tjkeding/ABCD_fmri_orchestration_S3.git
+git clone https://github.com/tjkeding/ABCD_fmri_orchestrator_S3.git
 cd ABCD_fmri_orchestration_S3
 
 # Create and activate the conda environment
 conda env create -f environment.yaml
-conda activate ABCD_fmri_orchestration_S3
+conda activate ABCD_fmri_orchestrator_S3
 
 # Verify AFNI is available
 3dinfo -ver
@@ -402,8 +402,6 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 | `orchestrator_utils.py` | All utility functions: S3 operations, file discovery, preprocessing, QC, config building, validation |
 | `example_orchestrator_config.yaml` | Annotated orchestrator config example for ABCD |
 | `environment.yaml` | Conda environment specification |
-| `ABCD_S3bucket_file_struct.md` | S3 key patterns and file structure documentation |
-| `raw_events_file_example.tsv` | Example BIDS events file (n-back task) |
 
 ### `orchestrator_utils.py` Section Index
 
@@ -477,10 +475,6 @@ processed_files["rest"] = {
 ### Note on Testing
 
 No automated test suite currently exists for this project. Validation is performed through `--dry-run` mode, per-run QC metrics, first-level QC checks, and log inspection.
-
-## License
-
-This project is developed for the ABCD study at Yale University.
 
 ## Author
 
