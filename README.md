@@ -1,4 +1,4 @@
-# ABCD_fmri_orchestration_S3
+# ABCD_fmri_orchestrator_S3
 
 A session-centric orchestrator for first-level fMRI processing on AWS EC2/S3, purpose-built for the Adolescent Brain and Cognitive Development (ABCD) study (~11,000 subjects, up to 4 timepoints, 2 functional imaging modalities). It wraps [fmri_first_level_proc](https://github.com/tjkeding/fmri_first_level_proc) and handles the full lifecycle of downloading fMRIPrep derivatives from S3, preprocessing, running first-level analyses, and uploading results — one session at a time to minimize disk usage on EC2 instances.
 
