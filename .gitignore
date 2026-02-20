@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+._*
+*.egg-info/
+dist/
+build/
+.eggs/
+*.log
+CLAUDE.md
+ABCD_S3bucket_file_struct.md
+first_level_todo.txt
+fmriprep_confounds_file_example.tsv
+raw_events_file_example.tsv
+raw_motion_file_example.tsv
