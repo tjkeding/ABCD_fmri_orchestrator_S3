@@ -55,7 +55,7 @@ run_orchestrator.py
 ```bash
 # Clone the repository
 git clone https://github.com/tjkeding/ABCD_fmri_orchestrator_S3.git
-cd ABCD_fmri_orchestration_S3
+cd ABCD_fmri_orchestrator_S3
 
 # Create and activate the conda environment
 conda env create -f environment.yaml
@@ -207,7 +207,7 @@ For resting-state tasks, extracts CSF, white matter, and global signal timeserie
 
 ### Step 11: Format Task Timing (Task Only)
 
-Converts BIDS events TSVs to the first-level timing CSV format (CONDITION, ONSET, DURATION). Adjusts onsets for removed non-steady-state TRs and drops events that fall before time 0 after adjustment. For n-back tasks with `fix_nback_cues: true`, generic "cue" trial types are relabeled with the stimulus condition inferred from the subsequent block of trials (e.g., "posface", "place").
+Converts BIDS events TSVs to the first-level timing CSV format (CONDITION, ONSET, DURATION). Adjusts onsets for removed non-steady-state TRs and drops events that fall before time 0 after adjustment. For n-back tasks with `fix_nback_cues: true`, generic "cue" trial types are relabeled based on the n-back level of the subsequent block: 0-back cues become the bare stimulus condition (e.g., "posface", "place") because they are passive viewing events, while 2-back cues become "instruction" because they are instruction screens preceding the recall task.
 
 ### Step 12: Concatenate Runs
 
@@ -368,7 +368,7 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 | >50% volumes censored | Warning logged; analysis still attempted |
 | Non-steady-state TRs detected | Trimmed from BOLD, confounds, and timing; onsets adjusted |
 | Events with onset < 0 after NSS trim | Events dropped with warning |
-| Generic "cue" labels in n-back events | Relabeled using condition of subsequent trial block (when `fix_nback_cues: true`) |
+| Generic "cue" labels in n-back events | 0-back cues relabeled with bare stimulus condition; 2-back cues relabeled as "instruction" (when `fix_nback_cues: true`) |
 | Archive extraction finds path traversal | Unsafe members skipped with warning |
 | Insufficient disk space for extraction | `OrchestratorError` raised (requires 10x archive size free) |
 | Already-existing output files | Skipped (idempotent); pipeline picks up where it left off |
