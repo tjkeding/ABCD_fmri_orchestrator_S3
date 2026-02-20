@@ -1,16 +1,16 @@
 # ============================================================================
-# Conda environment for ABCD_fmri_orchestration_S3
+# Conda environment for ABCD_fmri_orchestrator_S3
 # ============================================================================
 #
 # Create:  conda env create -f environment.yaml
-# Activate: conda activate ABCD_fmri_orchestration_S3
+# Activate: conda activate ABCD_fmri_orchestrator_S3
 # Update:  conda env update -f environment.yaml --prune
 #
 # NOTE: AFNI must be installed separately (not available via conda-forge).
 #       See https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html
 # ============================================================================
 
-name: ABCD_fmri_orchestration_S3
+name: ABCD_fmri_orchestrator_S3
 
 channels:
   - conda-forge
