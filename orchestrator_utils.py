@@ -6,8 +6,7 @@
 # Called by orchestrate_first_level.py in pipeline order.
 #
 # Author: Taylor J. Keding, Ph.D.
-# Version: 3.0
-# Last updated: 02/19/26
+# Last updated: 03/16/26
 # ============================================================================
 
 import os
@@ -33,6 +32,12 @@ from botocore.exceptions import ClientError, NoCredentialsError
 class OrchestratorError(Exception):
     """Raised for unrecoverable orchestrator errors."""
     pass
+
+
+# Valid task labels recognized by this orchestrator.
+# Defined here (authoritative) and imported into orchestrate_first_level.py
+# to avoid circular imports.
+VALID_TASK_LABELS = {"rest", "nback"}
 
 
 # ============================================================================
@@ -130,6 +135,7 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
     Downloads:
     1. fMRIPrep archive: sub-{ID}_ses-{session}A_fmriprep-output.tar.gz
     2. Events files (non-rest tasks only): probes for runs 1-9 per task
+    3. Motion files (ALL tasks, including rest): probes for runs 1-9 per task
 
     Parameters
     ----------
@@ -150,6 +156,7 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
     dict
         - archive_path: path to downloaded tar.gz
         - events_files: {task_label: [path1, path2, ...]} ordered by run
+        - motion_files: {task_label: [path1, path2, ...]} ordered by run
         - all_downloaded_paths: flat list of all files downloaded (for cleanup)
     """
     s3_client = _get_s3_client()
@@ -191,12 +198,12 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
     events_files = {}
     for task_def in task_defs:
         task_label = task_def["task_label"]
-        is_rest = task_label.lower().startswith("rest")
+        is_rest = (task_label == "rest")
         if is_rest:
             continue
 
         task_events = []
-        # Probe for runs 1-9, stop at first missing run
+        # Probe all run indices 1-9 unconditionally (runs may be non-contiguous)
         for run_num in range(1, 10):
             events_s3_key = (
                 f"{mmps_prefix}/sub-{sub_id}/{ses_label}/func/"
@@ -216,9 +223,13 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
 
             try:
                 s3_client.head_object(Bucket=bucket, Key=events_s3_key)
-            except ClientError:
-                # No more runs for this task
-                break
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("404", "NoSuchKey"):
+                    # Continue probing — run indices may be non-contiguous
+                    continue
+                else:
+                    raise
 
             try:
                 s3_client.download_file(bucket, events_s3_key, events_local)
@@ -232,7 +243,7 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
                     "Failed to download events file for sub-%s %s task-%s run-%d: %s",
                     sub_id, ses_label, task_label, run_num, str(e)
                 )
-                break
+                continue
 
         if task_events:
             events_files[task_label] = task_events
@@ -246,17 +257,168 @@ def download_session_data(s3_config, sub_id, session, task_defs, local_base_dir,
                 task_label, sub_id, ses_label
             )
 
+    # --- 3. Download motion files (ALL tasks, including rest) ---
+    motion_files = {}
+    for task_def in task_defs:
+        task_label = task_def["task_label"]
+
+        task_motions = []
+        for run_num in range(1, 10):
+            motion_s3_key = (
+                f"{mmps_prefix}/sub-{sub_id}/{ses_label}/func/"
+                f"sub-{sub_id}_{ses_label}_task-{task_label}_run-0{run_num}_motion.tsv"
+            )
+            motion_local_dir = os.path.join(local_ses_dir, "motion")
+            os.makedirs(motion_local_dir, exist_ok=True)
+            motion_local = os.path.join(
+                motion_local_dir,
+                f"sub-{sub_id}_{ses_label}_task-{task_label}_run-0{run_num}_motion.tsv"
+            )
+
+            if os.path.isfile(motion_local):
+                task_motions.append(motion_local)
+                all_downloaded.append(motion_local)
+                continue
+
+            try:
+                s3_client.head_object(Bucket=bucket, Key=motion_s3_key)
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("404", "NoSuchKey"):
+                    # Continue probing — run indices may be non-contiguous
+                    continue
+                else:
+                    raise
+
+            try:
+                s3_client.download_file(bucket, motion_s3_key, motion_local)
+                task_motions.append(motion_local)
+                all_downloaded.append(motion_local)
+                logger.debug(
+                    "Downloaded motion: s3://%s/%s", bucket, motion_s3_key
+                )
+            except ClientError as e:
+                logger.warning(
+                    "Failed to download motion file for sub-%s %s task-%s run-%d: %s",
+                    sub_id, ses_label, task_label, run_num, str(e)
+                )
+                continue
+
+        if task_motions:
+            motion_files[task_label] = task_motions
+            logger.info(
+                "Downloaded %d motion file(s) for task '%s' %s",
+                len(task_motions), task_label, ses_label
+            )
+        else:
+            logger.warning(
+                "No motion files found on S3 for task '%s' sub-%s %s",
+                task_label, sub_id, ses_label
+            )
+
     logger.info(
-        "S3 download summary for sub-%s %s: archive + %d events file(s)",
+        "S3 download summary for sub-%s %s: archive + %d events file(s) + %d motion file(s)",
         sub_id, ses_label,
-        sum(len(v) for v in events_files.values())
+        sum(len(v) for v in events_files.values()),
+        sum(len(v) for v in motion_files.values())
     )
 
     return {
         "archive_path": archive_local,
         "events_files": events_files,
+        "motion_files": motion_files,
         "all_downloaded_paths": all_downloaded,
     }
+
+
+def discover_local_mmps_files(local_base_dir, sub_id, session, task_defs, logger):
+    """
+    Discover previously-downloaded motion and events files on the local filesystem.
+
+    Used in local mode (S3 disabled) to find files that were downloaded during
+    a prior S3-enabled run. Mirrors the directory structure created by
+    download_session_data(): motion files in {base}/motion/, events in {base}/events/.
+
+    Parameters
+    ----------
+    local_base_dir : str
+        Root fMRIPrep directory (study.fmriprep_dir). Session data is expected
+        at {local_base_dir}/sub-{sub_id}/ses-{session}A/.
+    sub_id : str
+        Participant ID (e.g. "NDARABC123").
+    session : str
+        Session code (e.g. "00").
+    task_defs : list of dict
+        Task definitions from the orchestrator config.
+    logger : logging.Logger
+
+    Returns
+    -------
+    dict
+        {"events_files": {task_label: [paths]}, "motion_files": {task_label: [paths]}}
+
+    Raises
+    ------
+    FileNotFoundError
+        If no motion files are found for any task. This indicates a
+        misconfiguration (the user specified a local path but no downloaded
+        data exists there).
+    """
+    ses_label = f"ses-{session}A"
+    ses_dir = os.path.join(local_base_dir, f"sub-{sub_id}", ses_label)
+
+    motion_dir = os.path.join(ses_dir, "motion")
+    events_dir = os.path.join(ses_dir, "events")
+
+    motion_files = {}
+    events_files = {}
+
+    for task_def in task_defs:
+        task_label = task_def["task_label"]
+        is_rest = (task_label == "rest")
+
+        # --- Motion files (all tasks including rest) ---
+        if os.path.isdir(motion_dir):
+            pattern = os.path.join(
+                motion_dir,
+                f"sub-{sub_id}_{ses_label}_task-{task_label}_run-*_motion.tsv"
+            )
+            matched = sorted(globmod.glob(pattern))
+            if matched:
+                motion_files[task_label] = matched
+                logger.debug(
+                    "Local motion: task '%s' — %d file(s)", task_label, len(matched)
+                )
+
+        # --- Events files (non-rest tasks only) ---
+        if not is_rest and os.path.isdir(events_dir):
+            pattern = os.path.join(
+                events_dir,
+                f"sub-{sub_id}_{ses_label}_task-{task_label}_run-*_events.tsv"
+            )
+            matched = sorted(globmod.glob(pattern))
+            if matched:
+                events_files[task_label] = matched
+                logger.debug(
+                    "Local events: task '%s' — %d file(s)", task_label, len(matched)
+                )
+
+    total_motion = sum(len(v) for v in motion_files.values())
+    total_events = sum(len(v) for v in events_files.values())
+    logger.info(
+        "Local file discovery for sub-%s %s: %d motion file(s), %d events file(s)",
+        sub_id, ses_label, total_motion, total_events
+    )
+
+    if total_motion == 0:
+        raise FileNotFoundError(
+            f"No motion files found in local mode for sub-{sub_id} {ses_label}. "
+            f"Expected files at: {motion_dir}/ "
+            f"(pattern: sub-{sub_id}_{ses_label}_task-*_run-*_motion.tsv). "
+            f"Verify that a prior S3 download populated this directory."
+        )
+
+    return {"events_files": events_files, "motion_files": motion_files}
 
 
 def extract_session_archive(archive_path, target_dir, logger):
@@ -409,19 +571,19 @@ def upload_to_s3(s3_config, sub_id, session, archive_path, logger):
 
 def verify_afni_installation(logger):
     """
-    Verify that AFNI is installed and on PATH by running '3dinfo -ver'.
+    Verify that AFNI is installed and on PATH by running 'afni -ver'.
     Exits with error if AFNI is not found.
     """
     try:
         result = subprocess.run(
-            ["3dinfo", "-ver"],
+            ["afni", "-ver"],
             capture_output=True, text=True, check=True,
         )
         logger.info("AFNI version: %s", result.stdout.strip())
     except FileNotFoundError:
         raise OrchestratorError(
-            "AFNI not found on PATH. Please install AFNI and ensure it is "
-            "available in your environment."
+            "AFNI ('afni') not found on PATH. Please install AFNI and "
+            "ensure it is available in your environment."
         )
     except subprocess.CalledProcessError as e:
         raise OrchestratorError(
@@ -432,12 +594,13 @@ def verify_afni_installation(logger):
 # Section C: File Discovery
 # ============================================================================
 
-def discover_session_files(extracted_dir, sub_id, session, task_defs, events_files, space, logger):
+def discover_session_files(extracted_dir, sub_id, session, task_defs, events_files, motion_files, space, logger):
     """
     Discover fMRIPrep outputs from an extracted session archive.
 
     Globs the extracted func/ directory for all runs per task, matching
-    each discovered run with its corresponding events file (from mmps_mproc).
+    each discovered run with its corresponding events file (from mmps_mproc)
+    and raw motion file (from mmps_mproc).
 
     Parameters
     ----------
@@ -452,6 +615,9 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
     events_files : dict
         {task_label: [events_path_run1, events_path_run2, ...]} from
         download_session_data(). Missing tasks have no entry.
+    motion_files : dict
+        {task_label: [motion_path_run1, motion_path_run2, ...]} from
+        download_session_data(). Missing tasks have no entry.
     space : str
         Template space string (e.g. "MNI152NLin2009cAsym").
     logger : logging.Logger
@@ -461,7 +627,8 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
     dict
         {task_label: [run_dict, ...], "_anat_mask": anat_mask_path or None}
         Each run_dict has keys: bold_path, confounds_path, mask_path,
-        events_path (None for rest), session, task_label, run, run_label.
+        motion_tsv_path, events_path (None for rest), session, task_label,
+        run, run_label.
     """
     ses_label = f"ses-{session}A"
     func_dir = os.path.join(extracted_dir, "func")
@@ -469,7 +636,7 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
 
     for task_def in task_defs:
         task_label = task_def["task_label"]
-        is_rest = task_label.lower().startswith("rest")
+        is_rest = (task_label == "rest")
 
         # Glob for BOLD files to discover available runs
         bold_pattern = os.path.join(
@@ -496,6 +663,14 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
                 evt_match = re.search(r"_run-0?(\d+)_events\.tsv$", os.path.basename(evt_path))
                 if evt_match:
                     task_events_by_run[int(evt_match.group(1))] = evt_path
+
+        # Build motion file lookup dict keyed by run number
+        task_motion_by_run = {}
+        task_motions = motion_files.get(task_label, [])
+        for mot_path in task_motions:
+            mot_match = re.search(r"_run-0?(\d+)_motion\.tsv$", os.path.basename(mot_path))
+            if mot_match:
+                task_motion_by_run[int(mot_match.group(1))] = mot_path
 
         run_dicts = []
         for bold_path in bold_files:
@@ -537,6 +712,15 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
                 )
                 continue
 
+            # Match motion file by run number
+            motion_tsv_path = task_motion_by_run.get(run_num)
+            if motion_tsv_path is None:
+                logger.warning(
+                    "No motion file for sub-%s %s task-%s run-%d — skipping run",
+                    sub_id, ses_label, task_label, run_num
+                )
+                continue
+
             # Match events file by run number (for non-rest tasks)
             events_path = None
             if not is_rest:
@@ -560,6 +744,7 @@ def discover_session_files(extracted_dir, sub_id, session, task_defs, events_fil
                 "bold_path": bold_path,
                 "confounds_path": confounds_path,
                 "mask_path": mask_path,
+                "motion_tsv_path": motion_tsv_path,
                 "events_path": events_path,
                 "session": session,
                 "task_label": task_label,
@@ -688,7 +873,7 @@ def decompress_if_needed(file_path, logger):
 # Section E: Brain Masking
 # ============================================================================
 
-def apply_brain_mask(bold_path, mask_path, out_dir, out_prefix, logger):
+def apply_brain_mask(bold_path, mask_path, out_dir, out_prefix, logger, force_recompute=False):
     """
     Apply a brain mask to a BOLD file using AFNI's 3dcalc.
 
@@ -699,9 +884,13 @@ def apply_brain_mask(bold_path, mask_path, out_dir, out_prefix, logger):
     """
     out_path = os.path.join(out_dir, f"{out_prefix}_masked.nii.gz")
 
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Masked BOLD already exists: %s", out_path)
         return out_path
+
+    if force_recompute and os.path.isfile(out_path):
+        os.remove(out_path)
+        logger.debug("force_recompute: removed existing %s", out_path)
 
     cmd = [
         "3dcalc",
@@ -750,7 +939,7 @@ def detect_non_steady_state_trs(confounds_path, logger):
 
     return n_remove
 
-def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger):
+def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger, force_recompute=False):
     """
     Remove initial TRs from a BOLD file using AFNI's 3dTcat.
 
@@ -774,7 +963,7 @@ def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger):
 
     out_path = os.path.join(out_dir, f"{out_prefix}_trimmed.nii.gz")
 
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         try:
             result = subprocess.run(
                 ["3dinfo", "-nv", out_path],
@@ -785,6 +974,10 @@ def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger):
             n_trs = -1
         logger.info("Trimmed BOLD already exists: %s (%d TRs)", out_path, n_trs)
         return out_path, n_trs
+
+    if force_recompute and os.path.isfile(out_path):
+        os.remove(out_path)
+        logger.debug("force_recompute: removed existing %s", out_path)
 
     cmd = [
         "3dTcat",
@@ -845,29 +1038,25 @@ def remove_initial_trs_tabular(file_path, n_remove, out_path, logger):
     return out_path, n_rows
 
 # ============================================================================
-# Section G: Confounds Extraction
+# Section G: Motion and Confounds Extraction
 # ============================================================================
 
-def extract_motion_regressors(confounds_path, n_remove, calc_n_motion_derivs, out_path, logger):
+def extract_motion_regressors(motion_tsv_path, n_remove, calc_n_motion_derivs, out_path, logger, force_recompute=False):
     """
-    Extract motion regressors from fMRIPrep confounds file.
+    Extract motion regressors from a raw motion TSV file.
 
-    Always extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z).
-    For each requested derivative degree (1..calc_n_motion_derivs):
-      - Uses the column from the confounds TSV if fMRIPrep already computed it.
-      - Otherwise computes it numerically via finite differences on the
-        previous degree (padded with 0.0 at the first row to preserve length).
+    Reads the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the
+    raw motion.tsv file produced by mmps_mproc. Rotations are converted from
+    degrees to radians before writing the output .1D file (AFNI convention).
 
-    Total output columns = 6 * (1 + calc_n_motion_derivs).
-
-    fmri_first_level_proc will truncate extra columns as needed; the file
-    therefore contains the maximum number of columns any downstream analysis
-    may request.
+    Temporal derivatives are always computed numerically via finite differences
+    (padded with 0.0 at the first row to preserve length). Total output
+    columns = 6 * (1 + calc_n_motion_derivs).
 
     Parameters
     ----------
-    confounds_path : str
-        Path to fMRIPrep confounds TSV.
+    motion_tsv_path : str
+        Path to raw motion TSV file (columns: t_indx, rot_z/x/y, trans_z/x/y).
     n_remove : int
         Number of non-steady-state TRs to trim from the start.
     calc_n_motion_derivs : int
@@ -878,73 +1067,87 @@ def extract_motion_regressors(confounds_path, n_remove, calc_n_motion_derivs, ou
 
     Returns
     -------
-    str
-        Path to the motion regressors file.
+    tuple[str, bool]
+        (out_path, rotation_unit_ambiguous):
+        - out_path: path to the motion regressors file.
+        - rotation_unit_ambiguous: True when max(abs(rotation)) <= 1.0 and units
+          cannot be definitively determined (genuinely low-motion subject or data
+          already in radians). False when max(abs(rotation)) > 1.0, confirming
+          degrees. Always False when returning from cache (file already exists).
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Motion regressors already exist: %s", out_path)
-        return out_path
+        return out_path, False
 
-    confounds_df = pd.read_csv(confounds_path, sep="\t")
+    motion_df = pd.read_csv(motion_tsv_path, sep="\t")
 
-    if len(confounds_df) == 0:
-        raise OrchestratorError(f"Confounds file is empty (0 rows): {confounds_path}")
+    if len(motion_df) == 0:
+        raise OrchestratorError(f"Motion file is empty (0 rows): {motion_tsv_path}")
 
     base_cols = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
 
-    # Verify base columns exist
-    missing_base = [c for c in base_cols if c not in confounds_df.columns]
+    # Verify base columns exist (select by name; column order is NOT guaranteed)
+    missing_base = [c for c in base_cols if c not in motion_df.columns]
     if missing_base:
         raise OrchestratorError(
-            f"Missing base motion columns in {confounds_path}: {missing_base}. "
-            f"Available columns: {list(confounds_df.columns)}"
+            f"Missing base motion columns in {motion_tsv_path}: {missing_base}. "
+            f"Available columns: {list(motion_df.columns)}"
         )
 
     # Verify base columns contain valid data (not entirely NaN)
-    base_data = confounds_df[base_cols]
+    base_data = motion_df[base_cols]
     if base_data.isna().all().any():
         all_nan_cols = [c for c in base_cols if base_data[c].isna().all()]
         raise OrchestratorError(
-            f"Motion columns are entirely NaN in {confounds_path}: {all_nan_cols}. "
-            f"fMRIPrep output may be corrupted."
+            f"Motion columns are entirely NaN in {motion_tsv_path}: {all_nan_cols}. "
+            f"Motion data may be corrupted."
         )
 
+    # Rotation unit validation: exploit physical constraints of MRI head coils.
+    # 1.0 radian = 57.3 degrees — physically impossible inside a head coil.
+    # 1.0 degree is trivially common in any real fMRI scan.
+    rot_cols = motion_df[["rot_x", "rot_y", "rot_z"]].values
+    max_rot = float(np.nanmax(np.abs(rot_cols)))
+    rotation_unit_ambiguous = False
+    if max_rot > 1.0:
+        logger.info(
+            "Rotation unit check: PASSED (max abs rotation = %.4f > 1.0, definitively in degrees).",
+            max_rot
+        )
+    else:
+        # Cannot distinguish genuinely low-motion subjects from data already in
+        # radians. Real-world testing (ABCD sub-7L18GGXH, 17 runs rejected;
+        # 14 additional runs across 3 participants) confirmed that some ABCD
+        # subjects exhibit max rotations of 0.08–0.66 degrees throughout an
+        # entire session. Raising a fatal error was overly conservative.
+        # Proceed with deg2rad conversion and flag for QC review.
+        logger.warning(
+            "Rotation unit check AMBIGUOUS for %s: "
+            "max(abs(rotation)) = %.6f <= 1.0 across all TRs and axes. "
+            "Units cannot be definitively determined (genuinely low-motion "
+            "subject or data already in radians). Proceeding with deg2rad "
+            "conversion. Run flagged as rotation_unit_ambiguous=True for "
+            "QC review.",
+            motion_tsv_path, max_rot
+        )
+        rotation_unit_ambiguous = True
+
+    # Extract base parameters and convert rotations from degrees to radians
+    motion_array = motion_df[base_cols].values.copy()
+    motion_array[:, 3:] = np.deg2rad(motion_array[:, 3:])
+
     # Build the motion array column by column
-    # Start with base 6 parameters
-    arrays = [confounds_df[base_cols].values]  # shape (n_trs, 6)
+    arrays = [motion_array]  # shape (n_trs, 6)
     prev_degree_data = arrays[0]
 
-    # fMRIPrep derivative column name pattern:
-    #   degree 1 → trans_x_derivative1
-    #   degree 2 → trans_x_derivative1_power2  (NOT used here; we want the
-    #              temporal 2nd derivative, i.e. diff of 1st derivative)
-    # We use a simple naming convention: check for "_derivative{d}" suffix.
-    fmriprep_deriv_suffixes = {
-        1: "_derivative1",
-    }
-
     for degree in range(1, calc_n_motion_derivs + 1):
-        suffix = fmriprep_deriv_suffixes.get(degree)
-        fmriprep_cols = [f"{c}{suffix}" for c in base_cols] if suffix else []
-        available = fmriprep_cols and all(c in confounds_df.columns for c in fmriprep_cols)
-
-        if available:
-            deriv_data = confounds_df[fmriprep_cols].values
-            logger.info(
-                "Using fMRIPrep-computed derivative (degree %d) from confounds: %s",
-                degree, fmriprep_cols
-            )
-        else:
-            # Compute numerically: forward difference of the previous degree
-            # diff shape is (n_trs-1, 6); prepend a row of zeros for alignment
-            diff = np.diff(prev_degree_data, axis=0)
-            deriv_data = np.vstack([np.zeros((1, prev_degree_data.shape[1])), diff])
-            logger.info(
-                "fMRIPrep derivative (degree %d) not found in confounds — "
-                "computing numerically via finite differences.",
-                degree
-            )
-
+        # Always compute numerically: forward difference of the previous degree
+        diff = np.diff(prev_degree_data, axis=0)
+        deriv_data = np.vstack([np.zeros((1, prev_degree_data.shape[1])), diff])
+        logger.info(
+            "Computing motion derivative (degree %d) numerically via finite differences.",
+            degree
+        )
         arrays.append(deriv_data)
         prev_degree_data = deriv_data
 
@@ -954,86 +1157,37 @@ def extract_motion_regressors(confounds_path, n_remove, calc_n_motion_derivs, ou
     if n_remove > 0:
         motion_data = motion_data[n_remove:, :]
 
-    # Replace any remaining NaN with 0.0 (e.g. first-row fMRIPrep derivatives)
-    motion_data = np.nan_to_num(motion_data, nan=0.0)
+    # NaN handling: "unknown = censor" policy — impute 999.0 to guarantee censoring.
+    # NaN in motion parameters indicates a tracking failure — the true motion
+    # is unknown. Imputing 999.0 ensures these TRs exceed any reasonable FD
+    # threshold and are censored by upstream 1d_tool.py.
+    nan_mask = np.isnan(motion_data)
+    if nan_mask.any():
+        nan_rows, nan_cols = np.where(nan_mask)
+        col_labels = [f"col_{i}" for i in range(motion_data.shape[1])]
+        affected = [
+            f"TR {r} {col_labels[c]}"
+            for r, c in zip(nan_rows.tolist(), nan_cols.tolist())
+        ]
+        logger.warning(
+            "NaN motion values detected in %s: %d occurrence(s) across "
+            "%d unique TR(s). Imputing 999.0 (guarantees censoring). "
+            "Affected: %s",
+            motion_tsv_path,
+            int(nan_mask.sum()),
+            int(np.unique(nan_rows).size),
+            "; ".join(affected[:20]) + (" ..." if len(affected) > 20 else "")
+        )
+    motion_data = np.where(nan_mask, 999.0, motion_data)
 
     np.savetxt(out_path, motion_data, fmt="%.10g", delimiter="\t")
     logger.info(
         "Motion regressors saved: %d columns, %d rows → %s",
         motion_data.shape[1], motion_data.shape[0], out_path
     )
-    return out_path
+    return out_path, rotation_unit_ambiguous
 
-def generate_censor_file(confounds_path, n_remove, fd_threshold, out_path, logger):
-    """
-    Generate a binary censor file from framewise displacement.
-
-    FD <= threshold → 1 (include), FD > threshold → 0 (exclude).
-    First volume (NaN FD) is always included (1).
-
-    Returns
-    -------
-    tuple of (str, int, int)
-        (path, n_censored, n_total)
-    """
-    if os.path.isfile(out_path):
-        censor_data = np.loadtxt(out_path)
-        n_total = len(censor_data)
-        n_censored = int(np.sum(censor_data == 0))
-        logger.info("Censor file already exists: %s (%d/%d censored)", out_path, n_censored, n_total)
-        return out_path, n_censored, n_total
-
-    confounds_df = pd.read_csv(confounds_path, sep="\t")
-
-    if "framewise_displacement" not in confounds_df.columns:
-        raise OrchestratorError(
-            f"Column 'framewise_displacement' not found in {confounds_path}. "
-            f"Available columns: {list(confounds_df.columns)}"
-        )
-
-    fd = confounds_df["framewise_displacement"].values
-
-    # Remove initial TRs
-    if n_remove > 0:
-        fd = fd[n_remove:]
-
-    # Build censor array: 1 = include, 0 = exclude
-    censor = np.ones(len(fd), dtype=int)
-    for i in range(len(fd)):
-        if np.isnan(fd[i]):
-            # First volume after trim typically has NaN FD — always include
-            censor[i] = 1
-        elif fd[i] > fd_threshold:
-            censor[i] = 0
-
-    n_total = len(censor)
-    n_censored = int(np.sum(censor == 0))
-    pct_censored = (n_censored / n_total * 100) if n_total > 0 else 0
-
-    # All thresholds are informational warnings only. Motion-based exclusion
-    # is a post-hoc research decision made at the group level; the pipeline
-    # always attempts first-level analysis for any subject where AFNI can run.
-    if pct_censored > 50:
-        logger.warning(
-            "%.1f%% of volumes censored (%d/%d) in %s — exceeds 50%%. "
-            "First-level analysis will still be attempted; review QC output.",
-            pct_censored, n_censored, n_total, confounds_path
-        )
-    elif pct_censored > 25:
-        logger.warning(
-            "%.1f%% of volumes censored (%d/%d) in %s — exceeds 25%%.",
-            pct_censored, n_censored, n_total, confounds_path
-        )
-    else:
-        logger.info(
-            "%.1f%% of volumes censored (%d/%d) in %s",
-            pct_censored, n_censored, n_total, confounds_path
-        )
-
-    np.savetxt(out_path, censor, fmt="%d")
-    return out_path, n_censored, n_total
-
-def extract_tissue_signals(confounds_path, n_remove, tissue_type, out_path, logger):
+def extract_tissue_signals(confounds_path, n_remove, tissue_type, out_path, logger, force_recompute=False):
     """
     Extract a tissue/nuisance signal time series from fMRIPrep confounds.
 
@@ -1048,7 +1202,7 @@ def extract_tissue_signals(confounds_path, n_remove, tissue_type, out_path, logg
     str
         Path to the tissue signal file.
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Tissue signal (%s) already exists: %s", tissue_type, out_path)
         return out_path
 
@@ -1074,7 +1228,7 @@ def extract_tissue_signals(confounds_path, n_remove, tissue_type, out_path, logg
 # Section H: Task Timing
 # ============================================================================
 
-def fix_nback_cue_labels(events_path, condition_column, out_path, logger):
+def fix_nback_cue_labels(events_path, condition_column, out_path, logger, force_recompute=False):
     """
     Relabel generic "cue"/"Cue" trial types in n-back events files.
 
@@ -1113,7 +1267,7 @@ def fix_nback_cue_labels(events_path, condition_column, out_path, logger):
     OrchestratorError
         If a cue trial has no subsequent non-cue trial to infer its condition.
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Relabeled n-back events file already exists: %s", out_path)
         return out_path
 
@@ -1173,7 +1327,7 @@ def fix_nback_cue_labels(events_path, condition_column, out_path, logger):
     return out_path
 
 
-def format_task_timing(events_path, condition_column, conditions_include, conditions_exclude, n_remove, TR, out_path, logger):
+def format_task_timing(events_path, condition_column, conditions_exclude, n_remove, TR, out_path, logger, force_recompute=False):
 
     """
     Convert BIDS events.tsv to first-level timing CSV (CONDITION, ONSET, DURATION).
@@ -1186,9 +1340,10 @@ def format_task_timing(events_path, condition_column, conditions_include, condit
     tuple of (str, int)
         (path to timing CSV, number of events dropped due to onset adjustment)
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Task timing already exists: %s", out_path)
-        existing = pd.read_csv(out_path)
+        # Note: cached return does not preserve the original drop count;
+        # n_dropped is currently only logged, not used for downstream logic.
         return out_path, 0
 
     events_df = pd.read_csv(events_path, sep="\t")
@@ -1206,9 +1361,6 @@ def format_task_timing(events_path, condition_column, conditions_include, condit
         )
 
     # Filter conditions
-    if conditions_include is not None:
-        events_df = events_df[events_df[condition_column].isin(conditions_include)]
-
     if conditions_exclude is not None:
         events_df = events_df[~events_df[condition_column].isin(conditions_exclude)]
 
@@ -1246,7 +1398,7 @@ def format_task_timing(events_path, condition_column, conditions_include, condit
 # Section I: Run Concatenation
 # ============================================================================
 
-def concatenate_bolds(bold_paths, out_path, logger):
+def concatenate_bolds(bold_paths, out_path, logger, force_recompute=False):
     """
     Concatenate multiple BOLD runs using AFNI's 3dTcat.
     Single-run: copies file instead of running 3dTcat.
@@ -1256,9 +1408,13 @@ def concatenate_bolds(bold_paths, out_path, logger):
     str
         Path to the concatenated BOLD file.
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Concatenated BOLD already exists: %s", out_path)
         return out_path
+
+    if force_recompute and os.path.isfile(out_path):
+        os.remove(out_path)
+        logger.debug("force_recompute: removed existing %s", out_path)
 
     if len(bold_paths) == 1:
         shutil.copy2(bold_paths[0], out_path)
@@ -1280,9 +1436,9 @@ def concatenate_bolds(bold_paths, out_path, logger):
     logger.info("Concatenated %d BOLD runs → %s", len(bold_paths), out_path)
     return out_path
 
-def concatenate_tabular_files(file_paths, out_path, logger):
+def concatenate_tabular_files(file_paths, out_path, logger, force_recompute=False):
     """
-    Concatenate tabular files (motion, censor, tissue signals) by row stacking.
+    Concatenate tabular files (motion regressors, tissue signals) by row stacking.
 
     Handles both multi-column files (motion regressors) and single-column
     files (censor vectors, tissue signals) without format corruption:
@@ -1295,7 +1451,7 @@ def concatenate_tabular_files(file_paths, out_path, logger):
     str
         Path to the concatenated file.
     """
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Concatenated tabular file already exists: %s", out_path)
         return out_path
 
@@ -1333,7 +1489,7 @@ def concatenate_tabular_files(file_paths, out_path, logger):
     )
     return out_path
 
-def concatenate_task_timing(timing_paths, run_tr_counts, TR, out_path, logger):
+def concatenate_task_timing(timing_paths, run_tr_counts, TR, out_path, logger, force_recompute=False):
     """
     Concatenate task timing CSVs, adjusting onsets for cumulative run lengths.
 
@@ -1351,7 +1507,20 @@ def concatenate_task_timing(timing_paths, run_tr_counts, TR, out_path, logger):
     str
         Path to the concatenated timing CSV.
     """
-    if os.path.isfile(out_path):
+    if len(timing_paths) != len(run_tr_counts):
+        raise OrchestratorError(
+            f"Mismatch between timing files ({len(timing_paths)}) and "
+            f"TR counts ({len(run_tr_counts)}). These must correspond 1:1."
+        )
+
+    if any(c <= 0 for c in run_tr_counts):
+        bad = [(i, c) for i, c in enumerate(run_tr_counts) if c <= 0]
+        raise OrchestratorError(
+            f"Invalid TR count(s) in run_tr_counts: {bad}. "
+            f"All values must be positive integers."
+        )
+
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Concatenated timing already exists: %s", out_path)
         return out_path
 
@@ -1379,7 +1548,7 @@ def concatenate_task_timing(timing_paths, run_tr_counts, TR, out_path, logger):
 # Section J: Smoothing
 # ============================================================================
 
-def apply_smoothing(bold_path, mask_path, method, fwhm, out_dir, out_prefix, logger):
+def apply_smoothing(bold_path, mask_path, method, fwhm, out_dir, out_prefix, logger, force_recompute=False):
     """
     Apply spatial smoothing to BOLD data.
 
@@ -1397,9 +1566,13 @@ def apply_smoothing(bold_path, mask_path, method, fwhm, out_dir, out_prefix, log
     """
     out_path = os.path.join(out_dir, f"{out_prefix}_smoothed.nii.gz")
 
-    if os.path.isfile(out_path):
+    if os.path.isfile(out_path) and not force_recompute:
         logger.info("Smoothed BOLD already exists: %s", out_path)
         return out_path
+
+    if force_recompute and os.path.isfile(out_path):
+        os.remove(out_path)
+        logger.debug("force_recompute: removed existing %s", out_path)
 
     if method == "3dmerge":
         cmd = [
@@ -1434,6 +1607,78 @@ def apply_smoothing(bold_path, mask_path, method, fwhm, out_dir, out_prefix, log
 
     logger.info("Smoothing (%s, FWHM=%.1f mm) complete: %s", method, fwhm, out_path)
     return out_path
+
+# ============================================================================
+# Section J2: Mask Intersection
+# ============================================================================
+
+def compute_mask_intersection(mask_paths, out_path, logger,
+                              force_recompute=False):
+    """
+    Compute the intersection of multiple brain masks using 3dmask_tool -inter.
+
+    When only one mask is provided, returns that mask path directly (no-op).
+    For multiple masks, produces a conservative intersection where a voxel is
+    included only if it is non-zero in ALL input masks.
+
+    Parameters
+    ----------
+    mask_paths : list of str
+        Paths to binary NIfTI mask files.
+    out_path : str
+        Output path for the intersection mask.
+    logger : logging.Logger
+        Logger instance.
+    force_recompute : bool, optional
+        If True, recompute even if out_path exists. Default False.
+
+    Returns
+    -------
+    str
+        Path to the intersection mask (out_path, or the single input mask).
+    """
+    if len(mask_paths) == 1:
+        return mask_paths[0]
+
+    if os.path.isfile(out_path) and not force_recompute:
+        logger.info("Mask intersection already exists: %s", out_path)
+        return out_path
+
+    if force_recompute and os.path.isfile(out_path):
+        os.remove(out_path)
+        logger.debug("force_recompute: removed existing %s", out_path)
+
+    # Log reference mask grid dimensions to confirm inputs are grid-matched.
+    try:
+        dim_result = subprocess.run(
+            ["3dinfo", "-n4", mask_paths[0]],
+            capture_output=True, text=True, check=True
+        )
+        logger.debug(
+            "Mask intersection reference grid (3dinfo -n4): %s — %s",
+            os.path.basename(mask_paths[0]), dim_result.stdout.strip()
+        )
+    except Exception:
+        logger.debug("Could not retrieve grid dimensions for mask: %s", mask_paths[0])
+
+    cmd = ["3dmask_tool", "-inter", "-prefix", out_path,
+           "-input"] + list(mask_paths)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise OrchestratorError(
+            f"3dmask_tool mask intersection failed: "
+            f"{e.stderr.strip() if e.stderr else str(e)}"
+        )
+    if not os.path.isfile(out_path):
+        raise OrchestratorError(
+            f"3dmask_tool produced no output: {out_path}"
+        )
+    logger.info(
+        "Mask intersection (%d masks) → %s", len(mask_paths), out_path
+    )
+    return out_path
+
 
 # ============================================================================
 # Section K: QC — Preprocessing
@@ -1496,10 +1741,28 @@ def compute_tsnr(bold_path, mask_path, out_dir, out_prefix, logger):
     logger.info("Median brain tSNR = %.2f", median_tsnr)
     return median_tsnr
 
-def generate_carpet_plot(bold_path, mask_path, confounds_path, n_remove, fd_threshold, out_path, logger):
+def generate_carpet_plot(bold_path, mask_path, confounds_path, n_remove, out_path, logger):
 
     """
-    Generate a carpet plot: FD/DVARS traces on top, voxel x time heatmap below.
+    Generate a carpet plot: DVARS trace on top, voxel x time heatmap below.
+
+    FD is no longer computed or displayed by the orchestrator (pre-analysis
+    preprocessing QC). Motion metrics are deferred to per-analysis QC
+    (consolidated from upstream enorm.1D/censor.1D produced by fmri_first_level_proc).
+
+    Parameters
+    ----------
+    bold_path : str
+        Path to preprocessed BOLD NIfTI.
+    mask_path : str
+        Path to brain mask NIfTI.
+    confounds_path : str
+        Path to fMRIPrep confounds TSV (used for DVARS).
+    n_remove : int
+        Number of non-steady-state TRs removed from start.
+    out_path : str
+        Output path for carpet plot image.
+    logger : logging.Logger
     """
     try:
         import matplotlib
@@ -1512,15 +1775,13 @@ def generate_carpet_plot(bold_path, mask_path, confounds_path, n_remove, fd_thre
 
     confounds_df = pd.read_csv(confounds_path, sep="\t")
 
-    # Get FD and DVARS
-    fd = confounds_df.get("framewise_displacement", pd.Series(dtype=float)).values
+    # DVARS from confounds (derived from BOLD signal, unaffected by motion source)
     dvars = confounds_df.get("dvars", pd.Series(dtype=float)).values
 
     if n_remove > 0:
-        fd = fd[n_remove:]
         dvars = dvars[n_remove:]
 
-    n_vols = len(fd)
+    n_vols = len(dvars)
     time_axis = np.arange(n_vols)
 
     # Extract voxel timeseries within mask using 3dmaskdump
@@ -1550,25 +1811,17 @@ def generate_carpet_plot(bold_path, mask_path, confounds_path, n_remove, fd_thre
 
     # Create figure
     fig = plt.figure(figsize=(12, 8))
-    gs = GridSpec(3, 1, height_ratios=[1, 1, 4], hspace=0.3)
-
-    # FD trace
-    ax_fd = fig.add_subplot(gs[0])
-    ax_fd.plot(time_axis, fd, color="black", linewidth=0.5)
-    ax_fd.axhline(y=fd_threshold, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
-    ax_fd.set_ylabel("FD (mm)")
-    ax_fd.set_xlim(0, n_vols - 1)
-    ax_fd.set_xticklabels([])
+    gs = GridSpec(2, 1, height_ratios=[1, 4], hspace=0.3)
 
     # DVARS trace
-    ax_dvars = fig.add_subplot(gs[1])
+    ax_dvars = fig.add_subplot(gs[0])
     ax_dvars.plot(time_axis, dvars, color="black", linewidth=0.5)
     ax_dvars.set_ylabel("DVARS")
     ax_dvars.set_xlim(0, n_vols - 1)
     ax_dvars.set_xticklabels([])
 
     # Carpet plot
-    ax_carpet = fig.add_subplot(gs[2])
+    ax_carpet = fig.add_subplot(gs[1])
     ax_carpet.imshow(voxel_z, aspect="auto", cmap="gray", interpolation="none",
                      vmin=-2, vmax=2)
     ax_carpet.set_xlabel("Volume")
@@ -1595,9 +1848,19 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
         )
         n_func = float(r1.stdout.strip())
 
-        # Count voxels in anat mask
+        # Resample anat mask to func mask grid (they may differ in resolution)
+        resampled_anat_path = os.path.join(
+            os.path.dirname(func_mask_path), "_temp_anat_resampled.nii.gz"
+        )
+        subprocess.run(
+            ["3dresample", "-master", func_mask_path, "-rmode", "NN",
+             "-input", anat_mask_path, "-prefix", resampled_anat_path],
+            capture_output=True, text=True, check=True,
+        )
+
+        # Count voxels in resampled anat mask (recount after resampling)
         r2 = subprocess.run(
-            ["3dBrickStat", "-count", "-non-zero", anat_mask_path],
+            ["3dBrickStat", "-count", "-non-zero", resampled_anat_path],
             capture_output=True, text=True, check=True,
         )
         n_anat = float(r2.stdout.strip())
@@ -1605,7 +1868,7 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
         # Count intersection
         overlap_path = os.path.join(os.path.dirname(func_mask_path), "_temp_overlap.nii.gz")
         subprocess.run(
-            ["3dcalc", "-a", func_mask_path, "-b", anat_mask_path,
+            ["3dcalc", "-a", func_mask_path, "-b", resampled_anat_path,
              "-expr", "step(a)*step(b)", "-prefix", overlap_path],
             capture_output=True, text=True, check=True,
         )
@@ -1615,9 +1878,10 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
         )
         n_overlap = float(r3.stdout.strip())
 
-        # Clean up
-        if os.path.isfile(overlap_path):
-            os.remove(overlap_path)
+        # Clean up temp files
+        for tmp in (overlap_path, resampled_anat_path):
+            if os.path.isfile(tmp):
+                os.remove(tmp)
 
         dice = 2 * n_overlap / (n_func + n_anat) if (n_func + n_anat) > 0 else 0.0
         logger.info("Registration quality (Dice): %.4f", dice)
@@ -1627,20 +1891,42 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
         logger.warning("Could not compute registration quality: %s", str(e))
         return None
 
-def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove, TR, fd_threshold, qc_config, out_dir, sub_id, space, logger):
+def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove, qc_config, out_dir, sub_id, space, logger, anat_mask_path=None):
 
     """
-    Compute preprocessing QC metrics for a single run.
+    Compute pre-analysis preprocessing QC metrics for a single run.
 
-    The censor section records n_total_trs, n_censored_trs, n_clean_trs,
-    pct_censored, and clean_time_seconds. These fields are designed for
-    post-hoc group-level exclusion decisions (e.g. max 30% censored,
-    min 12 minutes of clean data). No motion-based gating is applied here.
+    Pre-analysis QC includes non-motion metrics only: tSNR, brain mask coverage,
+    registration Dice, DVARS (from fMRIPrep confounds), and carpet plots.
+    Motion metrics (FD, censor stats) are deferred to per-analysis QC
+    (consolidated session QC) where they are sourced exclusively from upstream
+    enorm.1D and censor.1D files produced by fmri_first_level_proc.
 
     Parameters
     ----------
-    TR : float
-        Repetition time in seconds (used to compute clean_time_seconds).
+    run_info : dict
+        Run metadata (session, task_label, run, run_label).
+    confounds_path : str
+        Path to fMRIPrep confounds TSV (used for DVARS).
+    bold_path : str
+        Path to preprocessed BOLD NIfTI (after masking).
+    mask_path : str
+        Path to brain mask NIfTI.
+    n_remove : int
+        Number of non-steady-state TRs detected.
+    qc_config : dict
+        QC configuration (tsnr, carpet_plots, registration_quality flags).
+    out_dir : str
+        Output directory for QC files.
+    sub_id : str
+        Subject ID prefix (e.g., "sub-NDARABC123").
+    space : str
+        Template space string (e.g., "MNI152NLin2009cAsym").
+    logger : logging.Logger
+    anat_mask_path : str or None
+        Path to the anatomical brain mask discovered by discover_session_files().
+        When provided, used directly for registration quality computation
+        instead of re-deriving the path internally.
 
     Returns
     -------
@@ -1657,35 +1943,7 @@ def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove,
 
     confounds_df = pd.read_csv(confounds_path, sep="\t")
 
-    # -- Motion metrics --
-    fd = confounds_df.get("framewise_displacement", pd.Series(dtype=float)).values
-    if n_remove > 0:
-        fd = fd[n_remove:]
-    fd_valid = fd[~np.isnan(fd)]
-
-    n_total_trs = len(fd)
-    n_censored_trs = int(np.sum(fd_valid > fd_threshold)) if len(fd_valid) > 0 else 0
-    n_clean_trs = n_total_trs - n_censored_trs
-    pct_censored = (n_censored_trs / n_total_trs * 100) if n_total_trs > 0 else None
-    clean_time_seconds = round(n_clean_trs * TR, 2)
-
-    qc["motion"] = {
-        "mean_fd": float(np.mean(fd_valid)) if len(fd_valid) > 0 else None,
-        "max_fd": float(np.max(fd_valid)) if len(fd_valid) > 0 else None,
-        "median_fd": float(np.median(fd_valid)) if len(fd_valid) > 0 else None,
-    }
-
-    # Censor stats: primary fields for post-hoc group-level exclusion
-    qc["censor"] = {
-        "fd_threshold_mm": fd_threshold,
-        "n_total_trs": n_total_trs,
-        "n_censored_trs": n_censored_trs,
-        "n_clean_trs": n_clean_trs,
-        "pct_censored": round(pct_censored, 2) if pct_censored is not None else None,
-        "clean_time_seconds": clean_time_seconds,
-    }
-
-    # -- DVARS metrics --
+    # -- DVARS metrics (from fMRIPrep confounds) --
     dvars = confounds_df.get("dvars", pd.Series(dtype=float)).values
     if n_remove > 0:
         dvars = dvars[n_remove:]
@@ -1731,51 +1989,53 @@ def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove,
     # -- Carpet plot --
     if qc_config.get("carpet_plots", False):
         carpet_path = os.path.join(out_dir, f"{sub_id}_{run_info['run_label']}_carpet.png")
-        generate_carpet_plot(bold_path, mask_path, confounds_path, n_remove,
-                             fd_threshold, carpet_path, logger)
+        generate_carpet_plot(bold_path, mask_path, confounds_path,
+                             n_remove, carpet_path, logger)
         qc["carpet_plot_path"] = carpet_path
     else:
         qc["carpet_plot_path"] = None
 
     # -- Registration quality --
     if qc_config.get("registration_quality", False):
-        # Look for anatomical brain mask in fMRIPrep
-        fmriprep_sub_dir = os.path.dirname(os.path.dirname(mask_path))
-        ses_part = run_info.get("session")
-        if ses_part:
-            anat_dir = os.path.join(fmriprep_sub_dir, ses_part, "anat")
-        else:
-            anat_dir = os.path.join(fmriprep_sub_dir, "anat")
+        anat_mask = anat_mask_path  # Use pre-discovered path when available
 
-        # Find anatomical brain mask matching the template space.
-        # Filter on space-{space} entity to avoid matching masks in a
-        # different space (e.g. T1w) that are also present in the anat dir.
-        anat_mask = None
-        if os.path.isdir(anat_dir):
-            space_tag = f"space-{space}"
-            candidates = [
-                f for f in os.listdir(anat_dir)
-                if "desc-brain_mask" in f
-                and space_tag in f
-                and f.endswith(".nii.gz")
-            ]
-            if candidates:
-                # Prefer exact match; fall back to first candidate
-                anat_mask = os.path.join(anat_dir, sorted(candidates)[0])
-                if len(candidates) > 1:
-                    logger.warning(
-                        "Multiple anat brain masks found for space '%s' in %s; "
-                        "using: %s", space, anat_dir, candidates[0]
-                    )
+        if anat_mask is None:
+            # Fallback: derive path from mask_path directory structure
+            fmriprep_sub_dir = os.path.dirname(os.path.dirname(mask_path))
+            ses_part = run_info.get("session")
+            if ses_part:
+                ses_dir_name = f"ses-{ses_part}A"
+                anat_dir = os.path.join(fmriprep_sub_dir, ses_dir_name, "anat")
+            else:
+                anat_dir = os.path.join(fmriprep_sub_dir, "anat")
+
+            if os.path.isdir(anat_dir):
+                space_tag = f"space-{space}"
+                candidates = [
+                    f for f in os.listdir(anat_dir)
+                    if "desc-brain_mask" in f
+                    and space_tag in f
+                    and f.endswith(".nii.gz")
+                ]
+                if candidates:
+                    anat_mask = os.path.join(anat_dir, sorted(candidates)[0])
+                    if len(candidates) > 1:
+                        logger.warning(
+                            "Multiple anat brain masks found for space '%s' in %s; "
+                            "using: %s", space, anat_dir, candidates[0]
+                        )
+
+            if anat_mask is None:
+                anat_dir_str = anat_dir
+                logger.info(
+                    "No anatomical brain mask found for space '%s' in %s — "
+                    "skipping registration quality check.", space, anat_dir_str
+                )
 
         if anat_mask is not None:
             dice = compute_registration_quality(mask_path, anat_mask, logger)
             qc["registration"] = {"dice": dice, "anat_mask": anat_mask}
         else:
-            logger.info(
-                "No anatomical brain mask found for space '%s' in %s — "
-                "skipping registration quality check.", space, anat_dir
-            )
             qc["registration"] = {"dice": None, "anat_mask": None}
     else:
         qc["registration"] = {"dice": None}
@@ -1789,14 +2049,14 @@ def save_qc_json(qc_metrics, out_path, logger):
         json.dump(qc_metrics, f, indent=2, default=str)
     logger.info("QC metrics saved: %s", out_path)
 
-def compute_first_level_qc(analysis_name, analysis_type, out_dir, sub_id, censor_proportion, logger, error_msg=None):
+def compute_first_level_qc(analysis_name, analysis_type, out_dir, sub_id, out_file_pre, logger, error_msg=None):
 
     """
     Compute first-level analysis QC metrics.
 
     Checks for expected output files by analysis type to determine whether
-    the analysis completed successfully. A QC JSON is always written even for
-    failed analyses so failures are visible in group-level QC aggregation.
+    the analysis completed successfully. Reads the upstream QC summary JSON
+    produced by fmri_first_level_proc for censor statistics and other metrics.
 
     Expected outputs by type:
       task_act  — at least one .nii.gz (stat bucket) in the analysis directory
@@ -1805,6 +2065,19 @@ def compute_first_level_qc(analysis_name, analysis_type, out_dir, sub_id, censor
 
     Parameters
     ----------
+    analysis_name : str
+        Name of the analysis block.
+    analysis_type : str
+        Type of the analysis (task_act, task_conn, rest_conn).
+    out_dir : str
+        Base output directory containing analysis subdirectories.
+    sub_id : str
+        Subject ID string (e.g. "sub-TEST001").
+    out_file_pre : str or None
+        Output file prefix used by fmri_first_level_proc. When not None,
+        the upstream QC summary is expected at
+        {out_dir}/{analysis_name}/{out_file_pre}_qc_summary.json.
+    logger : logging.Logger
     error_msg : str or None
         Error message if the analysis raised an exception; None on success.
 
@@ -1842,18 +2115,146 @@ def compute_first_level_qc(analysis_name, analysis_type, out_dir, sub_id, censor
             analysis_name, len(nifti_outputs)
         )
 
+    # Read upstream QC summary JSON produced by fmri_first_level_proc
+    pct_censored = None
+    upstream_qc = None
+    if out_file_pre is not None:
+        qc_json_path = os.path.join(analysis_dir, f"{out_file_pre}_qc_summary.json")
+        if os.path.isfile(qc_json_path):
+            try:
+                with open(qc_json_path) as f:
+                    upstream_qc = json.load(f)
+                pct_censored = upstream_qc.get("pct_censored")
+                if pct_censored is not None:
+                    pct_censored = round(float(pct_censored), 2)
+                logger.info(
+                    "First-level QC: read upstream QC summary for '%s' from %s",
+                    analysis_name, qc_json_path
+                )
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logger.warning(
+                    "First-level QC: could not parse upstream QC JSON for '%s' at %s: %s",
+                    analysis_name, qc_json_path, str(e)
+                )
+        else:
+            logger.warning(
+                "First-level QC: upstream QC summary not found for '%s' at %s",
+                analysis_name, qc_json_path
+            )
+
     qc = {
         "sub_id": sub_id,
         "analysis_name": analysis_name,
         "type": analysis_type,
-        "pct_censored": round(censor_proportion * 100, 2) if censor_proportion is not None else None,
+        "pct_censored": pct_censored,
         "completed_successfully": completed_successfully,
         "error": error_msg,
         "n_nifti_outputs": len(nifti_outputs),
         "output_files": output_files,
+        "upstream_qc": upstream_qc,
     }
 
     return qc
+
+# ============================================================================
+# Section K3: Consolidated Session QC
+# ============================================================================
+
+def consolidate_session_qc(sub_id, ses_label, session_status, session_wall_time,
+                           preproc_qc_by_run, analysis_outcomes, out_path, logger):
+    """
+    Build and write a consolidated session-level QC JSON.
+
+    Combines pre-analysis preprocessing QC and per-analysis QC into a
+    single file per session, replacing the previous pattern of separate
+    per-run and per-analysis JSON files.
+
+    Parameters
+    ----------
+    sub_id : str
+        Participant ID (e.g., "NDARABC123").
+    ses_label : str
+        Session label (e.g., "ses-00A").
+    session_status : str
+        Qualified session status: "success", "partial", or "failed".
+    session_wall_time : float
+        Total session wall time in seconds.
+    preproc_qc_by_run : dict
+        Mapping of run_label -> QC dict from compute_preproc_qc().
+    analysis_outcomes : list of dict
+        Per-analysis outcome dicts with keys: name, type, status, error,
+        wall_time_seconds, and optionally fl_qc.
+    out_path : str
+        Output path for the consolidated QC JSON.
+    logger : logging.Logger
+
+    Returns
+    -------
+    str
+        Path to the written QC JSON file.
+    """
+    from datetime import datetime, timezone
+
+    # Resolve orchestrator version from the entry-point module constant.
+    # Lazy import avoids circular dependency; fallback to "unknown" for
+    # environments that import orchestrator_utils in isolation (e.g. tests).
+    try:
+        from orchestrate_first_level import __version__ as _orch_ver
+    except ImportError:
+        _orch_ver = "unknown"
+
+    # Provenance block
+    afni_ver = None
+    try:
+        result = subprocess.run(
+            ["afni", "--version"], capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            afni_ver = result.stdout.strip()
+    except FileNotFoundError:
+        pass
+
+    proc_ver = None
+    try:
+        from fmri_first_level_proc import __version__ as _proc_ver
+        proc_ver = _proc_ver
+    except ImportError:
+        pass
+
+    qc = {
+        "provenance": {
+            "orchestrator_version": _orch_ver,
+            "fmri_first_level_proc_version": proc_ver,
+            "afni_version": afni_ver,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "sub_id": sub_id,
+            "session": ses_label,
+        },
+        "preprocessing": preproc_qc_by_run,
+        "analyses": {},
+        "session": {
+            "status": session_status,
+            "wall_time_seconds": round(session_wall_time, 2),
+            "n_analyses_attempted": len(analysis_outcomes),
+            "n_analyses_succeeded": sum(
+                1 for o in analysis_outcomes if o["status"] == "success"
+            ),
+        },
+    }
+
+    # Populate per-analysis entries
+    for outcome in analysis_outcomes:
+        qc["analyses"][outcome["name"]] = {
+            "type": outcome["type"],
+            "status": outcome["status"],
+            "error": outcome["error"],
+            "wall_time_seconds": outcome["wall_time_seconds"],
+            "upstream_qc": outcome.get("fl_qc"),
+        }
+
+    save_qc_json(qc, out_path, logger)
+    return out_path
+
 
 # ============================================================================
 # Section L: Config Building
@@ -1880,10 +2281,9 @@ def build_first_level_config(sub_id, session, study_config, task_defs, processed
     processed_files : dict
         Mapping of task_label -> processed file info.
         For task analyses (concatenated):
-            {"bold": path, "motion": path, "censor": {fd_thresh: path}, "timing": path}
+            {"bold": path, "motion": path, "timing": path}
         For rest analyses (per-run):
             {"bolds": [paths], "motions": [paths],
-             "censors": {fd_thresh: [paths]},
              "csf": [paths], "wm": [paths], "gs": [paths]}
     analyses : list of dict
         The 'analyses' section of the orchestrator config.
@@ -1900,6 +2300,17 @@ def build_first_level_config(sub_id, session, study_config, task_defs, processed
     output_dir = study_config["output_dir"]
     ses_label = f"ses-{session}A"
     session_out = os.path.join(output_dir, f"sub-{sub_id}", ses_label)
+
+    # Inject or validate global.tr against study.TR
+    config["global"] = config.get("global", {})
+    if "tr" in config["global"]:
+        if abs(config["global"]["tr"] - study_config["TR"]) > 1e-6:
+            raise OrchestratorError(
+                f"global.tr in proc template ({config['global']['tr']}) does not match "
+                f"study.TR ({study_config['TR']}). These must be consistent."
+            )
+    else:
+        config["global"]["tr"] = study_config["TR"]
 
     # Index template analyses by name for fast lookup
     template_by_name = {}
@@ -1938,36 +2349,22 @@ def build_first_level_config(sub_id, session, study_config, task_defs, processed
         prefix_base = f"sub-{sub_id}_{ses_label}"
         block["out_file_pre"] = f"{prefix_base}_{orch_analysis['post_id_out_pre']}"
 
+        # Inject per-analysis censoring parameters (handled by upstream)
+        block["fd_threshold"] = fd_threshold
+        block["censor_prev_tr"] = orch_analysis.get("censor_prev_tr", False)
+
         # Override paths based on analysis type
         if analysis_type in ("task_act", "task_conn"):
-            # Get censor file for this analysis's FD threshold
-            censor_path = pf["censor"].get(fd_threshold)
-            if censor_path is None:
-                raise OrchestratorError(
-                    f"No censor file for fd_threshold={fd_threshold} "
-                    f"(analysis '{analysis_name}', task '{task_label}')."
-                )
-
             block["paths"] = {
                 "scan_path": pf["bold"],
                 "task_timing_path": pf["timing"],
                 "motion_path": pf["motion"],
-                "censor_path": censor_path,
             }
 
         elif analysis_type == "rest_conn":
-            # Get censor files for this analysis's FD threshold
-            censor_paths = pf["censors"].get(fd_threshold)
-            if censor_paths is None:
-                raise OrchestratorError(
-                    f"No censor files for fd_threshold={fd_threshold} "
-                    f"(analysis '{analysis_name}', task '{task_label}')."
-                )
-
             block["paths"] = {
                 "scan_paths": pf["bolds"],
                 "motion_paths": pf["motions"],
-                "censor_paths": censor_paths,
                 "CSF_paths": pf["csf"],
                 "WM_paths": pf["wm"],
                 "GS_paths": pf.get("gs"),
@@ -2078,6 +2475,13 @@ def load_orchestrator_config(config_path, logger):
             raise OrchestratorError(f"tasks[{i}] missing required key 'task_label'.")
         # Runs are now discovered dynamically from S3 — not required in config
         task_labels.add(task["task_label"])
+        if task["task_label"] not in VALID_TASK_LABELS:
+            raise OrchestratorError(
+                f"tasks[{i}] task_label '{task['task_label']}' is not a recognized "
+                f"task label for this orchestrator. Valid labels: "
+                f"{sorted(VALID_TASK_LABELS)}. Check the 'tasks' section "
+                f"of the orchestrator config."
+            )
 
     # Validate analyses
     analyses = config["analyses"]
@@ -2120,6 +2524,13 @@ def load_orchestrator_config(config_path, logger):
             raise OrchestratorError(
                 f"[{name}] fd_threshold must be a positive number, got: {fd_val}"
             )
+
+        # Validate per-analysis censor_prev_tr (optional, must be bool)
+        if "censor_prev_tr" in analysis:
+            if not isinstance(analysis["censor_prev_tr"], bool):
+                raise OrchestratorError(
+                    f"[{name}] censor_prev_tr must be a boolean, got: {analysis['censor_prev_tr']!r}"
+                )
 
         atype = analysis["type"]
 
@@ -2196,6 +2607,14 @@ def load_orchestrator_config(config_path, logger):
                     f"s3.available_sessions entries must be strings, got: {s!r}"
                 )
 
+    # Validate force_recompute
+    study.setdefault("force_recompute", False)
+    if not isinstance(study.get("force_recompute"), bool):
+        raise OrchestratorError(
+            "study.force_recompute must be a boolean, got: "
+            f"{study['force_recompute']!r}"
+        )
+
     # Validate calc_n_motion_derivs
     study.setdefault("calc_n_motion_derivs", 1)
     if not isinstance(study["calc_n_motion_derivs"], int) or study["calc_n_motion_derivs"] < 0:
@@ -2252,6 +2671,14 @@ def validate_proc_template(orchestrator_config, proc_template, logger):
             "Proc template must have 'analyses' as a non-empty list."
         )
 
+    # Validate global block exists as a dict
+    global_block = proc_template.get("global")
+    if not isinstance(global_block, dict):
+        raise OrchestratorError(
+            "Proc template must have a 'global' block (dict). "
+            "Required fields: num_cores, tr (injected if omitted), template_path, force_diff_atlas."
+        )
+
     # Index template analyses by name
     template_by_name = {}
     for block in template_analyses:
@@ -2260,6 +2687,23 @@ def validate_proc_template(orchestrator_config, proc_template, logger):
             raise OrchestratorError(
                 "Proc template has an analysis block without a 'name' field."
             )
+
+        # Reject templates that still contain censor_path or censor_paths
+        paths_block = block.get("paths", {})
+        if paths_block and isinstance(paths_block, dict):
+            if "censor_path" in paths_block:
+                raise OrchestratorError(
+                    f"Proc template analysis '{bname}' contains 'censor_path' in its paths block. "
+                    f"Censor files are now auto-generated by fmri_first_level_proc from "
+                    f"fd_threshold; remove censor_path from the template."
+                )
+            if "censor_paths" in paths_block:
+                raise OrchestratorError(
+                    f"Proc template analysis '{bname}' contains 'censor_paths' in its paths block. "
+                    f"Censor files are now auto-generated by fmri_first_level_proc from "
+                    f"fd_threshold; remove censor_paths from the template."
+                )
+
         template_by_name[bname] = block
 
     orch_analyses = orchestrator_config["analyses"]
@@ -2326,10 +2770,19 @@ def validate_proc_template(orchestrator_config, proc_template, logger):
 
 def compress_session_outputs(sub_id, session, session_out_dir, logger):
     """
-    Compress a session's first-level output directory into a .tar.gz archive.
+    Compress a session's outputs into a .tar.gz archive for S3 upload.
 
-    Only the first_level_out/ subdirectory is included in the archive. The
-    archive is written atomically via a temporary file to prevent corruption.
+    Includes:
+      - first_level_out/  — analysis results and per-analysis QC
+      - qc/               — orchestrator QC JSON, preprocessing QC, carpet
+                            plots, tSNR maps
+      - Small provenance files from preproc/ and concat/ (motion regressors,
+        events, timing CSVs, tissue regressors, intersection masks) — excludes
+        large intermediate BOLD NIfTI files (*.nii.gz) which are regenerable
+        from fMRIPrep data on S3.
+
+    The archive is written atomically via a temporary file to prevent
+    corruption.
 
     Parameters
     ----------
@@ -2363,10 +2816,36 @@ def compress_session_outputs(sub_id, session, session_out_dir, logger):
         )
 
     ses_label = f"ses-{session}A"
+    archive_prefix = f"sub-{sub_id}_{ses_label}"
     tmp = archive_path + ".tmp"
     try:
         with tarfile.open(tmp, "w:gz") as tar:
-            tar.add(fl_out_dir, arcname=f"sub-{sub_id}_{ses_label}_first_level_out")
+            # first_level_out/ — full directory
+            tar.add(fl_out_dir, arcname=f"{archive_prefix}_first_level_out")
+
+            # qc/ — full directory (QC JSONs, carpet plots, tSNR maps)
+            qc_dir = os.path.join(session_out_dir, "qc")
+            if os.path.isdir(qc_dir):
+                tar.add(qc_dir, arcname=f"{archive_prefix}_qc")
+
+            # preproc/ — small provenance files only (exclude *.nii.gz)
+            preproc_dir = os.path.join(session_out_dir, "preproc")
+            if os.path.isdir(preproc_dir):
+                for fname in sorted(os.listdir(preproc_dir)):
+                    if not fname.endswith(".nii.gz"):
+                        fpath = os.path.join(preproc_dir, fname)
+                        if os.path.isfile(fpath):
+                            tar.add(fpath, arcname=f"{archive_prefix}_preproc/{fname}")
+
+            # concat/ — small provenance files only (exclude *.nii.gz)
+            concat_dir = os.path.join(session_out_dir, "concat")
+            if os.path.isdir(concat_dir):
+                for fname in sorted(os.listdir(concat_dir)):
+                    if not fname.endswith(".nii.gz"):
+                        fpath = os.path.join(concat_dir, fname)
+                        if os.path.isfile(fpath):
+                            tar.add(fpath, arcname=f"{archive_prefix}_concat/{fname}")
+
         os.rename(tmp, archive_path)
     except Exception:
         if os.path.isfile(tmp):

@@ -48,14 +48,21 @@ study:
   # Repetition time in seconds
   TR: 0.8
 
+  # Force recomputation of cached outputs. When false (default), preprocessing
+  # steps that find an existing output file will skip recomputation. Set to
+  # true to recompute all outputs regardless of existing files (e.g., after
+  # upstream changes to fMRIPrep derivatives or motion files).
+  force_recompute: false
+
   # Number of temporal derivative sets to compute for motion regressors.
   # Total output columns = 6 * (1 + calc_n_motion_derivs)
   #   0 -> 6 columns  (trans_x/y/z, rot_x/y/z only)
   #   1 -> 12 columns (base + first derivatives)
   #   2 -> 18 columns (base + first + second derivatives)
-  # If fMRIPrep already computed derivatives in the confounds TSV, they are
-  # used directly. Missing derivative sets are computed numerically (finite
-  # differences). fmri_first_level_proc truncates extra columns as needed.
+  # Motion parameters are sourced from raw motion.tsv files (mmps_mproc on
+  # S3), not from fMRIPrep confounds. Rotations are converted from degrees
+  # to radians. Derivatives are always computed numerically via finite
+  # differences. fmri_first_level_proc truncates extra columns as needed.
   calc_n_motion_derivs: 1
 
 # ============================================================================
@@ -107,10 +114,19 @@ smoothing:
 # ============================================================================
 # qc — Quality control settings
 # ============================================================================
-# QC metrics are saved as JSON files (one per run/analysis) designed for
-# easy group-level aggregation:
-#   qc_files = glob.glob("*/ses-*/qc/preproc/*_preproc_qc.json")
-#   df = pd.json_normalize([json.load(open(f)) for f in qc_files])
+# QC output is consolidated into a single JSON per session:
+#   sub-{ID}_ses-{session}A_orchestrator_qc.json
+#
+# Pre-analysis preprocessing QC (non-motion): DVARS, tSNR, brain mask coverage,
+#   registration Dice, carpet plots. Written by the orchestrator from fMRIPrep
+#   confounds and the BOLD signal.
+#
+# Per-analysis QC (motion-based): FD/censor stats, DOF, trial counts.
+#   Sourced from the upstream QC summary JSON produced by fmri_first_level_proc.
+#
+# Group-level aggregation example:
+#   import json, glob
+#   sessions = [json.load(open(f)) for f in glob.glob("*/ses-*/qc/*_orchestrator_qc.json")]
 qc:
 
   preproc:
@@ -119,7 +135,7 @@ qc:
     # Compute temporal signal-to-noise ratio (mean / stdev across time)
     tsnr: true
 
-    # Generate carpet plots (FD/DVARS traces + voxel x time heatmap)
+    # Generate carpet plots (DVARS trace + voxel x time heatmap; FD removed — see QC architecture)
     carpet_plots: true
 
     # Compute Dice coefficient between functional and anatomical brain masks
@@ -163,6 +179,7 @@ analyses:
     type: "task_act"
     task_label: "nback"
     fd_threshold: 0.9
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
     post_id_out_pre: "nback"
     post_id_extract_pre: "nback_Shen368"
 
@@ -173,6 +190,7 @@ analyses:
     type: "task_conn"
     task_label: "nback"
     fd_threshold: 0.9
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
     post_id_out_pre: "nback"
     post_id_extract_pre: "nback_Shen368"
     post_id_conn_pre: "nback_Shen368"
@@ -184,6 +202,7 @@ analyses:
     type: "rest_conn"
     task_label: "rest"
     fd_threshold: 0.4
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
     post_id_out_pre: "rest"
     post_id_extract_pre: "rest_Shen368"
     post_id_conn_pre: "rest_Shen368"
@@ -199,10 +218,12 @@ analyses:
 #      sub-{ID}_ses-{session}A_fmriprep-output.tar.gz
 #    Contains preprocessed BOLD, confounds, masks, and anatomical files.
 #
-# 2. mmps_mproc events:
+# 2. mmps_mproc events and motion files:
 #    s3://{bucket}/{mmps_mproc_s3_prefix}/sub-{ID}/ses-{session}A/func/
 #      sub-{ID}_ses-{session}A_task-{task}_run-0{N}_events.tsv
-#    Contains task timing (events) files.
+#      sub-{ID}_ses-{session}A_task-{task}_run-0{N}_motion.tsv
+#    Contains task timing (events) files and raw motion parameter files.
+#    Motion files are downloaded for ALL tasks (including rest).
 #
 # Sessions are discovered dynamically by probing S3 for each code in
 # available_sessions. Not all subjects have all sessions.

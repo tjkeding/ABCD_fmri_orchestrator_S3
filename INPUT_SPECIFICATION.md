@@ -12,8 +12,10 @@ This document provides a complete reference for all inputs accepted by `ABCD_fmr
 | Subject list (batch mode) | `--subject-list` flag | Section 4 below |
 | fMRIPrep archive on S3 | Downloaded automatically | Section 5 below |
 | Events files on S3 | Downloaded automatically | Section 5 below |
+| Motion files on S3 | Downloaded automatically | Section 5 below |
 | fMRIPrep confounds TSV | Inside archive | Section 7 below |
 | Task events TSV | From mmps_mproc on S3 | Section 8 below |
+| Motion TSV | From mmps_mproc on S3 | Section 8b below |
 
 ---
 
@@ -64,7 +66,8 @@ A non-empty list of first-level analysis specifications. Each entry links to a m
 | `name` | str | Yes | — | Analysis name. Must exactly match a `name` field in the proc template's `analyses` list. |
 | `type` | str | Yes | — | Analysis type. Must be one of: `task_act`, `task_conn`, `rest_conn`. Must match the corresponding type in the proc template. |
 | `task_label` | str | Yes | — | Which task this analysis operates on. Must match a `task_label` defined in the `tasks` section. |
-| `fd_threshold` | float | Yes | — | Framewise displacement threshold in mm for this analysis. Must be a positive number. Different analyses can use different thresholds. |
+| `fd_threshold` | float | Yes | — | Framewise displacement threshold in mm for this analysis. Must be a positive number. Different analyses can use different thresholds. Passed to `fmri_first_level_proc` for automatic censor generation. |
+| `censor_prev_tr` | bool | No | `false` | When `true`, the TR preceding a high-motion TR is also censored. Passed to `fmri_first_level_proc`. Must be a boolean if present. |
 | `post_id_out_pre` | str | Yes | — | Suffix appended to the session prefix to form `out_file_pre`. For subject `NDARABC123`, session `00`: `out_file_pre = "sub-NDARABC123_ses-00A_{post_id_out_pre}"`. |
 | `post_id_extract_pre` | str | Conditional | — | Required when the matching proc template analysis has an `extraction` block. Forms `extraction.extract_out_file_pre` using the same prefix pattern. |
 | `post_id_conn_pre` | str | Conditional | — | Required for `task_conn` and `rest_conn` types. Forms `connectivity.conn_out_file_pre` using the same prefix pattern. |
@@ -85,6 +88,7 @@ For subject `NDARABC123`, session `00`, with `post_id_out_pre: "nback"`:
 - `type` must be one of `{task_act, task_conn, rest_conn}`
 - `task_label` must reference an existing entry in the `tasks` section
 - `fd_threshold` must be a positive number
+- `censor_prev_tr`, if present, must be a boolean
 - `post_id_conn_pre` is required for `task_conn` and `rest_conn` types
 - `post_id_extract_pre` is required when the proc template has an `extraction` block for this analysis
 
@@ -120,7 +124,7 @@ If the `qc` section is omitted entirely, both preproc and first_level QC default
 | `enabled` | bool | No | `false` | — |
 | `bucket` | str | If enabled | — | Bucket name only. Must NOT start with `s3://`. |
 | `fmriprep_s3_prefix` | str | If enabled | — | S3 key prefix for fMRIPrep archives. No leading or trailing `/`. |
-| `mmps_mproc_s3_prefix` | str | If enabled | — | S3 key prefix for events files. No leading or trailing `/`. |
+| `mmps_mproc_s3_prefix` | str | If enabled | — | S3 key prefix for events and motion files. No leading or trailing `/`. |
 | `upload_prefix` | str | If enabled | — | S3 key prefix for uploading results. No leading or trailing `/`. |
 | `cleanup_after_upload` | bool | No | `true` | If true, delete downloaded/extracted files after successful upload. |
 | `available_sessions` | list of str | If enabled | `[]` | Pool of session codes to probe (e.g., `["00", "02", "04", "06"]`). Must be a non-empty list of strings when S3 is enabled. |
@@ -141,11 +145,16 @@ The proc template config (passed via `--proc_config`) is a standard `fmri_first_
 
 | Field | What It's Set To |
 |-------|-----------------|
+| `global.tr` | Injected from `study.TR` if not present in the template; validated for consistency if already present (error on mismatch) |
 | `analyses[].out_dir` | `{output_dir}/sub-{ID}/ses-{session}A/first_level_out/{analysis_name}` |
 | `analyses[].out_file_pre` | `sub-{ID}_ses-{session}A_{post_id_out_pre}` |
+| `analyses[].fd_threshold` | From the orchestrator analysis's `fd_threshold` |
+| `analyses[].censor_prev_tr` | From the orchestrator analysis's `censor_prev_tr` (default `false`) |
 | `analyses[].paths.*` | Resolved from preprocessed files (see below) |
 | `analyses[].extraction.extract_out_file_pre` | `sub-{ID}_ses-{session}A_{post_id_extract_pre}` (if extraction block exists) |
 | `analyses[].connectivity.conn_out_file_pre` | `sub-{ID}_ses-{session}A_{post_id_conn_pre}` (if connectivity block exists) |
+
+**TR consistency rule:** If `global.tr` is present in the proc template, it must match `study.TR` from the orchestrator config (error on mismatch, tolerance 1e-6). If `global.tr` is omitted, the orchestrator injects it from `study.TR`.
 
 **Path fields set per analysis type:**
 
@@ -153,15 +162,15 @@ For `task_act` and `task_conn`:
 - `paths.scan_path` — concatenated BOLD
 - `paths.task_timing_path` — concatenated timing CSV
 - `paths.motion_path` — concatenated motion regressors
-- `paths.censor_path` — concatenated censor file (for this analysis's FD threshold)
 
 For `rest_conn`:
 - `paths.scan_paths` — list of per-run BOLDs
 - `paths.motion_paths` — list of per-run motion regressors
-- `paths.censor_paths` — list of per-run censor files (for this analysis's FD threshold)
 - `paths.CSF_paths` — list of per-run CSF signal files
 - `paths.WM_paths` — list of per-run white matter signal files
 - `paths.GS_paths` — list of per-run global signal files (or null)
+
+**Note:** Censor files are no longer generated by the orchestrator or passed as paths. Censoring is handled automatically by `fmri_first_level_proc` using the `fd_threshold` and `censor_prev_tr` fields injected into each analysis block.
 
 ### Everything Else
 
@@ -178,14 +187,16 @@ All other fields in the proc template are passed through verbatim to the generat
 
 The orchestrator validates the proc template against the orchestrator config at startup:
 
-1. Proc template must have `analyses` as a non-empty list
-2. Every proc template analysis block must have a `name` field
-3. Every orchestrator analysis `name` must have a matching entry in the proc template
-4. `type` fields must match for each name-matched pair
-5. `post_id_out_pre` must be present in every orchestrator analysis
-6. `post_id_extract_pre` is required when the matching proc template analysis has an `extraction` block
-7. `post_id_conn_pre` is required for `task_conn` and `rest_conn` types
-8. Proc template analyses not referenced by the orchestrator config produce a warning and are removed from the generated config
+1. Proc template must have a `global` block (dict)
+2. Proc template must have `analyses` as a non-empty list
+3. Every proc template analysis block must have a `name` field
+4. No proc template analysis paths block may contain `censor_path` or `censor_paths` (these are now auto-generated by upstream)
+5. Every orchestrator analysis `name` must have a matching entry in the proc template
+6. `type` fields must match for each name-matched pair
+7. `post_id_out_pre` must be present in every orchestrator analysis
+8. `post_id_extract_pre` is required when the matching proc template analysis has an `extraction` block
+9. `post_id_conn_pre` is required for `task_conn` and `rest_conn` types
+10. Proc template analyses not referenced by the orchestrator config produce a warning and are removed from the generated config
 
 For the full proc template specification, see the upstream [fmri_first_level_proc INPUT_SPECIFICATION.md](https://github.com/tjkeding/fmri_first_level_proc/blob/main/INPUT_SPECIFICATION.md).
 
@@ -253,6 +264,31 @@ mmps_mproc/sub-NDARABC123/ses-00A/func/sub-NDARABC123_ses-00A_task-nback_run-02_
 
 Events files are only downloaded for non-rest tasks.
 
+### Motion Files
+
+**S3 key pattern:**
+```
+{mmps_mproc_s3_prefix}/sub-{ID}/ses-{session}A/func/sub-{ID}_ses-{session}A_task-{task}_run-0{N}_motion.tsv
+```
+
+Where `N` ranges from 1 to 9. The orchestrator probes sequentially starting from run 1 and stops at the first missing run number.
+
+Example:
+```
+mmps_mproc/sub-NDARABC123/ses-00A/func/sub-NDARABC123_ses-00A_task-nback_run-01_motion.tsv
+mmps_mproc/sub-NDARABC123/ses-00A/func/sub-NDARABC123_ses-00A_task-rest_run-01_motion.tsv
+```
+
+Motion files are downloaded for **ALL tasks, including rest** (unlike events files which skip rest). Every scan with neuroimaging data has a corresponding motion file. If a motion file is not found for a discovered run, that run is skipped with a warning.
+
+**File format:**
+- Tab-separated values with a header row
+- Columns: `t_indx`, `rot_z`, `rot_x`, `rot_y`, `trans_z`, `trans_x`, `trans_y`
+- Column order is NOT guaranteed — the orchestrator always selects columns by name
+- `t_indx` = TR index (ignored during processing)
+- Rotations are in **degrees** (converted to radians by the orchestrator before writing `.1D` output)
+- Translations are in **mm**
+
 ### Upload Target
 
 **S3 key pattern:**
@@ -288,21 +324,12 @@ The `space` entity in filenames must exactly match `study.space` in the orchestr
 
 The confounds timeseries file output by fMRIPrep. Every row corresponds to one TR.
 
-| Column | Used For | Required | Fallback |
-|--------|----------|----------|----------|
-| `trans_x` | Motion regressor (translation X) | Yes | Error if missing |
-| `trans_y` | Motion regressor (translation Y) | Yes | Error if missing |
-| `trans_z` | Motion regressor (translation Z) | Yes | Error if missing |
-| `rot_x` | Motion regressor (rotation X) | Yes | Error if missing |
-| `rot_y` | Motion regressor (rotation Y) | Yes | Error if missing |
-| `rot_z` | Motion regressor (rotation Z) | Yes | Error if missing |
-| `trans_x_derivative1` | First temporal derivative of trans_x | No | Computed numerically via finite differences |
-| `trans_y_derivative1` | First temporal derivative of trans_y | No | Computed numerically via finite differences |
-| `trans_z_derivative1` | First temporal derivative of trans_z | No | Computed numerically via finite differences |
-| `rot_x_derivative1` | First temporal derivative of rot_x | No | Computed numerically via finite differences |
-| `rot_y_derivative1` | First temporal derivative of rot_y | No | Computed numerically via finite differences |
-| `rot_z_derivative1` | First temporal derivative of rot_z | No | Computed numerically via finite differences |
-| `framewise_displacement` | Censor file generation, motion QC | Yes | Error if missing |
+| Column | Used For | Required | Notes |
+|--------|----------|----------|-------|
+| `trans_x`, `trans_y`, `trans_z` | **NOT USED** — motion sourced from raw motion.tsv | No | Ignored; motion parameters are read from mmps_mproc motion.tsv |
+| `rot_x`, `rot_y`, `rot_z` | **NOT USED** — motion sourced from raw motion.tsv | No | Ignored; motion parameters are read from mmps_mproc motion.tsv |
+| `trans_*_derivative1`, `rot_*_derivative1` | **NOT USED** — derivatives computed numerically from raw motion.tsv | No | Ignored; derivatives are computed by `extract_motion_regressors()` |
+| `framewise_displacement` | **NOT USED** — FD computed by `fmri_first_level_proc` from motion.1D | No | Ignored; FD and censor files are auto-generated upstream |
 | `dvars` | QC carpet plots, DVARS metrics | No | Omitted from QC if missing |
 | `non_steady_state_outlier_*` | Detecting non-steady-state TRs | No | 0 TRs removed if no columns present |
 | `csf` | CSF nuisance regressor (rest only) | Conditional | Error if missing for rest tasks |
@@ -310,11 +337,9 @@ The confounds timeseries file output by fMRIPrep. Every row corresponds to one T
 | `global_signal` | Global signal regressor (rest only) | Conditional | Error if missing for rest tasks |
 
 **Notes:**
-- The 6 base motion columns (`trans_x/y/z`, `rot_x/y/z`) must not be entirely NaN
-- `framewise_displacement` first row is typically NaN and is always treated as "include" (censor = 1)
+- All motion parameters, derivatives, and framewise displacement are sourced from raw motion.tsv files (mmps_mproc), NOT from the confounds TSV. The confounds TSV is retained only for DVARS, non-steady-state detection, and tissue signals.
 - `non_steady_state_outlier_*` columns: each column corresponds to one NSS TR (e.g., 3 columns = 3 TRs to remove)
-- Derivative columns (e.g., `trans_x_derivative1`) are used if present; otherwise the orchestrator computes derivatives numerically
-- NaN values in motion derivatives are replaced with 0.0
+- NaN values in motion regressors are replaced with 0.0
 
 ---
 
@@ -367,6 +392,79 @@ After non-steady-state TR removal, event onsets are adjusted:
 
 ---
 
+## 8b. Motion TSV (Raw Motion Parameters)
+
+Raw motion parameter files from the mmps_mproc pipeline on S3. These are the authoritative source for all motion-related information in the orchestrator (not fMRIPrep confounds).
+
+### File Format
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `t_indx` | int | — | TR index (ignored by the orchestrator) |
+| `trans_x` | float | mm | Translation along the X axis |
+| `trans_y` | float | mm | Translation along the Y axis |
+| `trans_z` | float | mm | Translation along the Z axis |
+| `rot_x` | float | degrees | Rotation around the X axis |
+| `rot_y` | float | degrees | Rotation around the Y axis |
+| `rot_z` | float | degrees | Rotation around the Z axis |
+
+**Column order is NOT guaranteed** — the orchestrator always selects columns by name.
+
+### Framewise Displacement (FD) Computation
+
+FD is **not** computed by the orchestrator. The orchestrator's role is limited to
+extracting raw motion parameters from the motion.tsv file and writing them to a
+`.1D` file for consumption by `fmri_first_level_proc`. FD computation, censor file
+generation, and motion-based QC metrics are performed exclusively by
+`fmri_first_level_proc` using the AFNI `1d_tool.py` utility with the configured
+`fd_threshold` and `censor_prev_tr` parameters. FD-based metrics are reported in
+the upstream QC summary JSON and surfaced in the consolidated session QC output
+under `analyses.{name}.upstream_qc`.
+
+### Degree-to-Radian Conversion
+
+Rotations in the raw motion.tsv are in degrees. **`extract_motion_regressors()`**
+converts them to radians (`np.deg2rad()`) before writing the output `.1D` file
+(AFNI convention).
+
+### Processing Flow
+
+1. Raw motion.tsv is downloaded from S3 (for ALL tasks including rest)
+2. `discover_session_files()` matches each motion file to its corresponding run via `motion_tsv_path`
+3. `extract_motion_regressors()` reads the raw motion.tsv, converts rotations to radians, computes numerical derivatives, and writes the output `.1D` file; this `.1D` file is passed to `fmri_first_level_proc`
+4. `fmri_first_level_proc` uses the motion `.1D` file along with `fd_threshold` and `censor_prev_tr` to generate censor files and compute FD-based QC metrics (reported in the upstream QC summary JSON)
+
+**Note:** FD is not computed by the orchestrator's preprocessing QC. Pre-analysis QC (computed by `compute_preproc_qc()`) contains only non-motion metrics (DVARS, tSNR, brain mask coverage, registration). Motion metrics are sourced from the upstream per-analysis QC summary produced by `fmri_first_level_proc`.
+
+### Return Schemas
+
+**`download_session_data()` returns:**
+```python
+{
+    "archive_path": str,
+    "events_files": {task_label: [path1, path2, ...]},
+    "motion_files": {task_label: [path1, path2, ...]},  # ALL tasks including rest
+    "all_downloaded_paths": [str, ...],
+}
+```
+
+**`discover_session_files()` run_dict includes:**
+```python
+{
+    "bold_path": str,
+    "confounds_path": str,
+    "mask_path": str,
+    "motion_tsv_path": str,  # raw motion.tsv from mmps_mproc
+    "events_path": str or None,
+    "session": str,
+    "task_label": str,
+    "run": int,
+    "run_label": str,
+}
+```
+
+---
+
 ## 9. Validation Rules Summary
 
 All validation checks performed at startup, with error message patterns and source functions.
@@ -389,6 +487,7 @@ All validation checks performed at startup, with error message patterns and sour
 | Analysis has post_id_out_pre | `[{name}] Missing required key 'post_id_out_pre'.` | Yes |
 | Analysis has fd_threshold | `[{name}] Missing required key 'fd_threshold'.` | Yes |
 | fd_threshold is positive | `[{name}] fd_threshold must be a positive number, got: {value}` | Yes |
+| censor_prev_tr is boolean | `[{name}] censor_prev_tr must be a boolean, got: {value}` | Yes |
 | Connectivity types have post_id_conn_pre | `[{name}] {type} analysis requires 'post_id_conn_pre'.` | Yes |
 | Smoothing method valid | `smoothing.method must be '3dmerge' or '3dBlurToFWHM', got '{method}'.` | Yes |
 | Smoothing FWHM positive | `smoothing.fwhm must be a positive number, got: {value}` | Yes |
@@ -406,6 +505,9 @@ All validation checks performed at startup, with error message patterns and sour
 |-------|----------------------|--------|
 | Template not null | `Proc template config is empty (null).` | Yes |
 | Template has analyses list | `Proc template must have 'analyses' as a non-empty list.` | Yes |
+| Template has global block | `Proc template must have a 'global' block (dict).` | Yes |
+| No censor_path in template | `Proc template analysis '{name}' contains 'censor_path' in its paths block.` | Yes |
+| No censor_paths in template | `Proc template analysis '{name}' contains 'censor_paths' in its paths block.` | Yes |
 | Template analyses have names | `Proc template has an analysis block without a 'name' field.` | Yes |
 | Name match exists | `Orchestrator analysis '{name}' has no matching entry in proc template.` | Yes |
 | Type match | `Type mismatch for analysis '{name}': orchestrator has '{type1}', proc template has '{type2}'.` | Yes |
@@ -418,93 +520,91 @@ All validation checks performed at startup, with error message patterns and sour
 
 ## 10. Output File Schemas
 
-### 10.1 Preprocessing QC JSON
+### 10.1 Consolidated Session QC JSON
 
-One file per task/run: `{sub_id}_{run_label}_preproc_qc.json`
+One file per session: `{sub_id}_{ses_label}_orchestrator_qc.json`, written to `{output_dir}/sub-{ID}/ses-{session}A/qc/`.
+
+This file combines pre-analysis preprocessing QC (non-motion metrics) and per-analysis QC (status and motion metrics from upstream) into a single authoritative record for the session. It replaces the former pattern of separate per-run `preproc_qc.json` and per-analysis `first_level_qc.json` files.
+
+**Pre-analysis preprocessing metrics** are stored under `preprocessing.{run_label}` and contain only non-motion metrics computed by the orchestrator from fMRIPrep confounds and the BOLD signal. Motion metrics (FD, censor counts) are excluded from preprocessing QC; they are sourced from upstream `enorm.1D`/`censor.1D` files produced by `fmri_first_level_proc`.
+
+**Per-analysis metrics** are stored under `analyses.{analysis_name}` and include per-analysis status, wall time, and the full upstream QC dict from `fmri_first_level_proc` (which contains FD-based censor statistics, DOF, trial counts, etc.).
 
 ```json
 {
-  "sub_id": "sub-NDARABC123",
-  "session": "00",
-  "task": "nback",
-  "run": 1,
-  "non_steady_state_trs": 3,
-  "motion": {
-    "mean_fd": 0.182,
-    "max_fd": 1.456,
-    "median_fd": 0.134
+  "provenance": {
+    "orchestrator_version": "3.1",
+    "fmri_first_level_proc_version": "2.3.0",
+    "afni_version": "AFNI_24.0.01",
+    "timestamp_utc": "2026-03-13T17:00:00+00:00",
+    "sub_id": "NDARABC123",
+    "session": "ses-00A"
   },
-  "censor": {
-    "fd_threshold_mm": 0.9,
-    "n_total_trs": 380,
-    "n_censored_trs": 12,
-    "n_clean_trs": 368,
-    "pct_censored": 3.16,
-    "clean_time_seconds": 294.4
+  "preprocessing": {
+    "ses-00A_task-nback_run-01": {
+      "sub_id": "sub-NDARABC123",
+      "session": "00",
+      "task": "nback",
+      "run": 1,
+      "non_steady_state_trs": 3,
+      "dvars": {
+        "mean": 25.34,
+        "max": 89.12
+      },
+      "tsnr": {
+        "median_brain": 45.67
+      },
+      "brain_mask": {
+        "n_voxels": 168432,
+        "volume_mm3": 1347456.0
+      },
+      "carpet_plot_path": "/path/to/qc/preproc/sub-NDARABC123_ses-00A_task-nback_run-01_carpet.png",
+      "registration": {
+        "dice": 0.912,
+        "anat_mask": "/path/to/anat/mask.nii.gz"
+      }
+    }
   },
-  "dvars": {
-    "mean": 25.34,
-    "max": 89.12
+  "analyses": {
+    "nback_act": {
+      "type": "task_act",
+      "status": "success",
+      "error": null,
+      "wall_time_seconds": 142.5,
+      "upstream_qc": {
+        "pct_censored": 3.16,
+        "n_trs_total": 380,
+        "n_trs_censored": 12,
+        "dof": 175
+      }
+    },
+    "nback_conn": {
+      "type": "task_conn",
+      "status": "failed",
+      "error": "AFNI exited with code 1",
+      "wall_time_seconds": 5.2,
+      "upstream_qc": null
+    }
   },
-  "tsnr": {
-    "median_brain": 45.67
-  },
-  "brain_mask": {
-    "n_voxels": 168432,
-    "volume_mm3": 1347456.0
-  },
-  "carpet_plot_path": "/path/to/qc/preproc/sub-NDARABC123_ses-00A_task-nback_run-1_carpet.png",
-  "registration": {
-    "dice": 0.912,
-    "anat_mask": "/path/to/anat/mask.nii.gz"
+  "session": {
+    "status": "partial",
+    "wall_time_seconds": 310.8,
+    "n_analyses_attempted": 2,
+    "n_analyses_succeeded": 1
   }
 }
 ```
 
 **Key fields for group-level exclusion decisions:**
-- `censor.clean_time_seconds` — total clean (uncensored) scan time
-- `censor.pct_censored` — percentage of volumes exceeding FD threshold
-- `motion.mean_fd` — average framewise displacement
+- `analyses.{name}.upstream_qc.pct_censored` — percentage of volumes censored at this analysis's FD threshold
+- `analyses.{name}.status` — `"success"`, `"failed"`
+- `session.status` — `"success"`, `"partial"`, `"failed"`
+- `preprocessing.{run}.dvars.mean` — mean DVARS (signal instability proxy)
+- `preprocessing.{run}.registration.dice` — functional/anatomical mask overlap
 
-### 10.2 First-Level QC JSON
+The upstream QC summary is read from `{out_dir}/{analysis_name}/{out_file_pre}_qc_summary.json`. If this file is missing or cannot be parsed, `upstream_qc` is `null` with a warning logged.
 
-One file per analysis: `{sub_id}_{ses_label}_{analysis_name}_first_level_qc.json`
-
-```json
-{
-  "sub_id": "sub-NDARABC123",
-  "session": "ses-00A",
-  "analysis_name": "nback_act",
-  "type": "task_act",
-  "pct_censored": 3.16,
-  "completed_successfully": true,
-  "error": null,
-  "n_nifti_outputs": 4,
-  "output_files": [
-    "sub-NDARABC123_ses-00A_nback_stats.nii.gz",
-    "sub-NDARABC123_ses-00A_nback_bucket.nii.gz",
-    "sub-NDARABC123_ses-00A_nback_fitts.nii.gz",
-    "sub-NDARABC123_ses-00A_nback_errts.nii.gz"
-  ]
-}
-```
-
-For failed analyses:
-```json
-{
-  "sub_id": "sub-NDARABC123",
-  "session": "ses-00A",
-  "analysis_name": "nback_act",
-  "type": "task_act",
-  "pct_censored": 78.42,
-  "completed_successfully": false,
-  "error": "AFNI exited with code 1",
-  "n_nifti_outputs": 0,
-  "output_files": []
-}
-```
-
-### 10.3 Batch Summary CSV
+### 10.2 Batch Summary CSV
 
 Written by `run_orchestrator.py` after all subjects complete (or on Ctrl+C).
 
@@ -518,7 +618,7 @@ Written by `run_orchestrator.py` after all subjects complete (or on Ctrl+C).
 
 Default filename: `{log_dir}/run_summary_{YYYYMMDD_HHMMSS}.csv`
 
-### 10.4 Internal Data Structure: `processed_files`
+### 10.3 Internal Data Structure: `processed_files`
 
 This dict is not written to disk but is the central data structure passing information between pipeline steps. Documented here for developers.
 
@@ -527,9 +627,6 @@ This dict is not written to disk but is the central data structure passing infor
 processed_files[task_label] = {
     "bold": str,        # Path to concatenated BOLD
     "motion": str,      # Path to concatenated motion regressors
-    "censor": {         # Dict: fd_threshold (float) -> path (str)
-        0.9: str,       # Path to concatenated censor file at this threshold
-    },
     "timing": str,      # Path to concatenated timing CSV, or None if no events
 }
 ```
@@ -539,9 +636,6 @@ processed_files[task_label] = {
 processed_files[task_label] = {
     "bolds": [str, ...],       # List of per-run BOLD paths
     "motions": [str, ...],     # List of per-run motion regressor paths
-    "censors": {               # Dict: fd_threshold (float) -> list of paths
-        0.4: [str, ...],       # Per-run censor file paths at this threshold
-    },
     "csf": [str, ...],        # List of per-run CSF signal paths
     "wm": [str, ...],         # List of per-run WM signal paths
     "gs": [str, ...] or None, # List of per-run global signal paths, or None
@@ -549,8 +643,8 @@ processed_files[task_label] = {
 ```
 
 Key differences between the two formats:
-- Task format uses singular keys (`bold`, `motion`, `censor`, `timing`) with single paths
-- Rest format uses plural keys (`bolds`, `motions`, `censors`, `csf`, `wm`, `gs`) with lists of paths
-- `censor` (task) maps threshold -> single path; `censors` (rest) maps threshold -> list of paths
+- Task format uses singular keys (`bold`, `motion`, `timing`) with single paths
+- Rest format uses plural keys (`bolds`, `motions`, `csf`, `wm`, `gs`) with lists of paths
 - Only rest format has tissue signal fields (`csf`, `wm`, `gs`)
 - Only task format has `timing`
+- Censor files are no longer part of `processed_files`; censoring is handled automatically by `fmri_first_level_proc` using the `fd_threshold` and `censor_prev_tr` fields injected into each analysis block

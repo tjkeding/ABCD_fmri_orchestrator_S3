@@ -20,25 +20,24 @@ run_orchestrator.py
      │
      └──► _process_session()  [per session]
           │
-          ├── Step 1:  Download session data from S3 (archive + events)
+          ├── Step 1:  Download session data from S3 (archive + events + motion)
           ├── Step 2:  Extract fMRIPrep archive
-          ├── Step 3:  Discover files per task (glob func/ directory)
+          ├── Step 3:  Discover files per task (glob func/ + match motion files)
           │
           │   ┌── Per task, per run ──────────────────────────────┐
           ├── │ Step 4:  Decompress if needed (.bz2/.gz/.tar.gz) │
           │   │ Step 5:  Apply brain mask (3dcalc)               │
-          │   │ Step 6:  Preprocessing QC (tSNR, carpet plots)   │
+          │   │ Step 6:  Preprocessing QC (FD from raw motion)    │
           │   │ Step 7:  Detect & remove non-steady-state TRs    │
-          │   │ Step 8:  Generate censor files (per FD threshold) │
-          │   │ Step 9:  Extract motion regressors                │
-          │   │ Step 10: Extract tissue signals (rest only)       │
-          │   │ Step 11: Format task timing (task only)           │
+          │   │ Step 8:  Extract motion regressors (from raw TSV) │
+          │   │ Step 9:  Extract tissue signals (rest only)       │
+          │   │ Step 10: Format task timing (task only)           │
           │   └──────────────────────────────────────────────────┘
           │
-          ├── Step 12: Concatenate runs (task) or collect per-run (rest)
+          ├── Step 11: Concatenate runs (task) or collect per-run (rest)
           │             + optional spatial smoothing
-          ├── Step 13: Build first-level config & run analyses
-          └── Step 14: Compress outputs → upload to S3 → cleanup
+          ├── Step 12: Build first-level config & run analyses
+          └── Step 13: Compress outputs → upload to S3 → cleanup
 ```
 
 ## Prerequisites and Installation
@@ -167,7 +166,7 @@ When S3 is enabled, the orchestrator probes S3 for each session code in `s3.avai
 
 ### Step 1: Download Session Data from S3
 
-Downloads two types of files: (1) the fMRIPrep archive (`.tar.gz` containing BOLD, confounds, masks, and anatomical files) and (2) task events files from the `mmps_mproc` prefix. Events files are probed for runs 1–9 per non-rest task; download stops at the first missing run number. Already-present local files are skipped (idempotent).
+Downloads three types of files: (1) the fMRIPrep archive (`.tar.gz` containing BOLD, confounds, masks, and anatomical files), (2) task events files from the `mmps_mproc` prefix (non-rest tasks only), and (3) raw motion parameter files from `mmps_mproc` (ALL tasks including rest). Events and motion files are probed for runs 1–9 per task; download stops at the first missing run number. Already-present local files are skipped (idempotent).
 
 ### Step 2: Extract fMRIPrep Archive
 
@@ -175,7 +174,7 @@ Extracts the `.tar.gz` archive with safety checks: disk space verification (requ
 
 ### Step 3: Discover Files Per Task
 
-Globs the extracted `func/` directory for BOLD files matching each task label and template space. For each discovered run, the corresponding confounds TSV, brain mask, and events file (matched by run number, not position) must all exist for the run to be included. Missing files produce warnings and the run is skipped. An anatomical brain mask is also discovered for optional registration QC.
+Globs the extracted `func/` directory for BOLD files matching each task label and template space. For each discovered run, the corresponding confounds TSV, brain mask, raw motion file, and events file (matched by run number, not position) must all exist for the run to be included. Missing files produce warnings and the run is skipped. An anatomical brain mask is also discovered for optional registration QC.
 
 ### Step 4: Decompress If Needed
 
@@ -187,37 +186,33 @@ Uses AFNI `3dcalc` with expression `a*step(b)` to zero out non-brain voxels. Pro
 
 ### Step 6: Preprocessing QC
 
-Computes per-run quality metrics: motion statistics (mean/max/median FD), censor counts, DVARS, brain mask coverage, and optionally tSNR (median within-brain temporal signal-to-noise), carpet plots (FD + DVARS traces over voxel-by-time heatmap), and registration quality (Dice coefficient between functional and anatomical brain masks). Metrics are saved as JSON for group-level aggregation. Skipped if `--skip-qc` is set or `qc.preproc.enabled` is false.
+Computes per-run, non-motion quality metrics. DVARS (from fMRIPrep confounds), brain mask coverage (voxel count and volume in mm^3), and optionally tSNR (median within-brain temporal signal-to-noise ratio), carpet plots (DVARS trace above voxel-by-time heatmap), and registration quality (Dice coefficient between functional and anatomical brain masks) are computed. Motion metrics (FD, censor counts) are not computed here; they are sourced from upstream `enorm.1D`/`censor.1D` files produced by `fmri_first_level_proc` and reported in the per-analysis section of the consolidated session QC JSON. Skipped if `--skip-qc` is set or `qc.preproc.enabled` is false.
 
 ### Step 7: Detect and Remove Non-Steady-State TRs
 
 Counts `non_steady_state_outlier_*` columns in the fMRIPrep confounds file to determine how many initial TRs to remove. Uses AFNI `3dTcat` to trim the BOLD timeseries. If no non-steady-state TRs are detected, the file passes through unchanged.
 
-### Step 8: Generate Censor Files
+### Step 8: Extract Motion Regressors
 
-Creates binary censor vectors (1 = include, 0 = exclude) based on framewise displacement. One censor file is generated per unique FD threshold needed by the analyses referencing this task. For example, if two analyses use the same task but different FD thresholds (0.4 and 0.9), two censor files are produced. The first volume (NaN FD) is always included. Warnings are issued at >25% and >50% censored, but **no motion gating is applied** — the pipeline always attempts first-level analysis, leaving exclusion decisions to post-hoc group-level analysis.
+Extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the raw motion.tsv file (not fMRIPrep confounds). Rotations are converted from degrees to radians before writing the output `.1D` file. Temporal derivatives are always computed numerically via finite differences (padded with 0.0 at the first row). Total output columns = `6 * (1 + calc_n_motion_derivs)`. Remaining NaN values are replaced with 0.0.
 
-### Step 9: Extract Motion Regressors
-
-Extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the confounds TSV. Temporal derivatives are included based on `study.calc_n_motion_derivs`: fMRIPrep-computed derivatives are used if available, otherwise computed numerically via finite differences. Total output columns = `6 * (1 + calc_n_motion_derivs)`. Remaining NaN values (e.g., first-row derivatives) are replaced with 0.0.
-
-### Step 10: Extract Tissue Signals (Rest Only)
+### Step 9: Extract Tissue Signals (Rest Only)
 
 For resting-state tasks, extracts CSF, white matter, and global signal timeseries from the confounds TSV for use as nuisance regressors in rest_conn analyses.
 
-### Step 11: Format Task Timing (Task Only)
+### Step 10: Format Task Timing (Task Only)
 
 Converts BIDS events TSVs to the first-level timing CSV format (CONDITION, ONSET, DURATION). Adjusts onsets for removed non-steady-state TRs and drops events that fall before time 0 after adjustment. For n-back tasks with `fix_nback_cues: true`, generic "cue" trial types are relabeled based on the n-back level of the subsequent block: 0-back cues become the bare stimulus condition (e.g., "posface", "place") because they are passive viewing events, while 2-back cues become "instruction" because they are instruction screens preceding the recall task.
 
-### Step 12: Concatenate Runs
+### Step 11: Concatenate Runs
 
-For tasks with `concatenate_runs: true` (default for non-rest tasks): concatenates BOLD files (AFNI `3dTcat`), motion regressors, censor vectors, and task timing (with onset adjustment for cumulative run lengths). For single-run tasks, files are copied rather than concatenated. For rest tasks (`concatenate_runs: false`): per-run files are collected as lists. Optional spatial smoothing is applied after concatenation (or per-run for rest).
+For tasks with `concatenate_runs: true` (default for non-rest tasks): concatenates BOLD files (AFNI `3dTcat`), motion regressors, and task timing (with onset adjustment for cumulative run lengths). For single-run tasks, files are copied rather than concatenated. For rest tasks (`concatenate_runs: false`): per-run files are collected as lists. Optional spatial smoothing is applied after concatenation (or per-run for rest).
 
-### Step 13: Build Config and Run First-Level Analyses
+### Step 12: Build Config and Run First-Level Analyses
 
-Deep-copies the proc template config and overrides only subject-specific fields (paths, output directories, session-aware prefixes). The orchestrator changes the working directory to the session output directory before running AFNI to prevent `3dDeconvolve.err` file collisions between concurrent sessions. Each analysis runs independently — if one fails, others continue. First-level QC is computed per analysis (completion check, censor proportion, error tracking).
+Deep-copies the proc template config and overrides only subject-specific fields (paths, output directories, session-aware prefixes). Injects `global.tr` from `study.TR` if not already present (validates match if present). Injects per-analysis `fd_threshold` and `censor_prev_tr` fields; censoring is handled automatically by `fmri_first_level_proc`. The orchestrator changes the working directory to the session output directory before running AFNI to prevent `3dDeconvolve.err` file collisions between concurrent sessions. Each analysis runs independently — if one fails, others continue. First-level QC reads the upstream QC summary JSON produced by `fmri_first_level_proc` for censor statistics and other metrics. After all analyses complete, a consolidated session-level QC JSON (`orchestrator_qc.json`) is written, combining pre-analysis preprocessing metrics with per-analysis status and upstream motion metrics.
 
-### Step 14: Compress, Upload, Cleanup
+### Step 13: Compress, Upload, Cleanup
 
 When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive using atomic writes (temp file + rename), (b) uploads to S3 with size verification, (c) cleans up downloaded and extracted files if `s3.cleanup_after_upload` is true. Cleanup also runs on session failure to free disk space.
 
@@ -229,7 +224,6 @@ When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive u
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_masked.nii.gz
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_trimmed.nii.gz
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_motion.1D
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_censor_fd{threshold}.1D
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_timing.csv
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_events_fixed.tsv  (nback only)
 │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_csf.1D            (rest only)
@@ -239,7 +233,7 @@ When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive u
 ├── concat/                                               # Concatenated files (task only)
 │   ├── sub-{ID}_ses-{session}A_task-{task}_concat_bold.nii.gz
 │   ├── sub-{ID}_ses-{session}A_task-{task}_concat_motion.1D
-│   ├── sub-{ID}_ses-{session}A_task-{task}_concat_censor_fd{threshold}.1D
+│   ├── sub-{ID}_ses-{session}A_task-{task}_concat_mask.nii.gz   (intersection of per-run masks)
 │   └── sub-{ID}_ses-{session}A_task-{task}_concat_timing.csv
 │
 ├── first_level_out/                                      # Analysis outputs (uploaded to S3)
@@ -248,11 +242,9 @@ When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive u
 │   └── ...
 │
 ├── qc/
-│   ├── preproc/                                          # Per-run QC JSONs + carpet plots
-│   │   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_preproc_qc.json
+│   ├── preproc/                                          # Per-run carpet plot images
 │   │   └── sub-{ID}_ses-{session}A_task-{task}_run-{N}_carpet.png
-│   └── first_level/                                      # Per-analysis QC JSONs
-│       └── sub-{ID}_ses-{session}A_{analysis_name}_first_level_qc.json
+│   └── sub-{ID}_ses-{session}A_orchestrator_qc.json      # Consolidated session QC JSON
 │
 ├── sub-{ID}_ses-{session}A_first_level_config.yaml       # Generated proc config
 └── first_level_out.tar.gz                                # Compressed archive for S3 upload
@@ -262,44 +254,48 @@ Only `first_level_out/` is included in the uploaded S3 archive. Preprocessing in
 
 ## Quality Control
 
-### Preprocessing QC
+### Consolidated Session QC
 
-Per-run JSON files containing:
+One JSON file per session (`sub-{ID}_ses-{session}A_orchestrator_qc.json`) combining:
 
-- **Motion**: mean, max, and median framewise displacement
-- **Censor**: total TRs, censored TRs, clean TRs, percent censored, clean time in seconds (based on the minimum FD threshold for the task)
-- **DVARS**: mean and max
+**Provenance block:**
+- `orchestrator_version`, `fmri_first_level_proc_version`, `afni_version`, `timestamp_utc`
+
+**Per-run preprocessing metrics (non-motion, computed by the orchestrator):**
+- **DVARS**: mean and max (from fMRIPrep confounds)
 - **tSNR**: median within-brain temporal signal-to-noise ratio (optional, via `qc.preproc.tsnr`)
 - **Brain mask**: voxel count and volume in mm^3
-- **Carpet plots**: FD + DVARS traces above voxel-by-time heatmap (optional, via `qc.preproc.carpet_plots`)
+- **Carpet plots**: DVARS trace above voxel-by-time heatmap (optional, via `qc.preproc.carpet_plots`); saved as PNG to `qc/preproc/`
 - **Registration quality**: Dice coefficient between functional and anatomical brain masks (optional, via `qc.preproc.registration_quality`)
 
-### First-Level QC
-
-Per-analysis JSON files containing:
-
-- **completed_successfully**: whether at least one non-empty NIfTI output was produced and no error was raised
-- **pct_censored**: percentage of volumes censored at this analysis's FD threshold
+**Per-analysis metrics (motion and status, sourced from upstream):**
+- **completed_successfully**: whether at least one non-empty NIfTI output was produced
+- **pct_censored**: percentage of volumes censored (read from upstream QC summary JSON produced by `fmri_first_level_proc`)
+- **upstream_qc**: full upstream QC dict (censor stats, DOF, trial counts, etc.) or null if not available
 - **error**: error message if the analysis failed, else null
-- **n_nifti_outputs**: count of NIfTI files produced
-- **output_files**: list of all files in the analysis output directory
+- **wall_time_seconds**: analysis wall time
+
+**Session summary:**
+- **status**: qualified session status (`success`, `partial`, or `failed`)
+- **n_analyses_attempted**, **n_analyses_succeeded**, **wall_time_seconds**
+
+Motion metrics (FD, censor counts) are not computed by the orchestrator. They are sourced from the upstream `enorm.1D` and `censor.1D` files produced by `fmri_first_level_proc` and reported via the `upstream_qc` block.
 
 ### Group-Level Aggregation
 
-QC JSONs are designed for easy aggregation with pandas:
+Consolidated QC JSONs are designed for easy aggregation with pandas:
 
 ```python
 import json, glob
 import pandas as pd
 
-# Preprocessing QC
-qc_files = glob.glob("*/ses-*/qc/preproc/*_preproc_qc.json")
-df = pd.json_normalize([json.load(open(f)) for f in qc_files])
+# Consolidated session QC
+qc_files = glob.glob("*/ses-*/qc/sub-*_orchestrator_qc.json")
+sessions = [json.load(open(f)) for f in qc_files]
 
 # Key fields for exclusion decisions:
-#   censor.clean_time_seconds  — minimum clean data duration
-#   censor.pct_censored        — maximum censoring rate
-#   motion.mean_fd             — mean head motion
+#   analyses[name].upstream_qc.pct_censored  — censoring rate per analysis
+#   session.status                           — success / partial / failed
 ```
 
 ## S3 Data Structure
@@ -330,11 +326,11 @@ The outer loop iterates over sessions (not tasks or processing steps). Each sess
 
 ### Per-Analysis FD Thresholds
 
-FD thresholds are specified per analysis, not per study. This allows resting-state analyses to use stricter thresholds (e.g., 0.4 mm) while task analyses use more lenient ones (e.g., 0.9 mm). Censor files are generated per unique (task, threshold) combination and named with the threshold in the filename (e.g., `_censor_fd0.4.1D`).
+FD thresholds are specified per analysis, not per study. This allows resting-state analyses to use stricter thresholds (e.g., 0.4 mm) while task analyses use more lenient ones (e.g., 0.9 mm). The `fd_threshold` and `censor_prev_tr` fields are injected into each analysis block of the generated config and passed to `fmri_first_level_proc`, which handles censor file generation automatically.
 
 ### No Motion-Based Gating
 
-The pipeline always attempts first-level analysis for every subject, regardless of motion severity. Warnings are logged at >25% and >50% censored volumes, but no subjects are automatically excluded. Motion-based exclusion is a post-hoc research decision made at the group level using the QC metrics (particularly `censor.clean_time_seconds` and `censor.pct_censored`).
+The pipeline always attempts first-level analysis for every subject, regardless of motion severity. No subjects are automatically excluded. Motion-based exclusion is a post-hoc research decision made at the group level using the QC metrics (particularly `analyses.{name}.upstream_qc.pct_censored` and `session.status` from the consolidated session QC JSON).
 
 ### Deep-Copy Proc Template
 
@@ -344,13 +340,13 @@ The first-level config is built by deep-copying the proc template and overriding
 
 Within a session, each analysis runs independently. If one analysis fails (e.g., AFNI error, insufficient data), other analyses for the same session continue. Across sessions, each session is processed independently — a failed session does not prevent other sessions from being processed. A subject is only marked as fully failed if all sessions fail.
 
+### Motion Data from Raw Files
+
+All motion parameters, framewise displacement (FD), and motion derivatives are sourced from raw motion.tsv files (mmps_mproc), NOT from fMRIPrep's confounds_timeseries.tsv. This is because fMRIPrep's motion parameters in the confounds file do not include motion correction information. FD is recomputed from raw parameters using the Power et al. (2012) formula with r=50mm. Rotations are converted from degrees to radians for both FD computation and the output .1D file (AFNI convention). DVARS, tissue signals, and non-steady-state detection remain sourced from confounds (derived from the BOLD signal, unaffected by motion source).
+
 ### Idempotent Outputs
 
 Every processing step checks whether its output file already exists before running. This makes the pipeline safe to re-run after a partial failure — it picks up where it left off without re-doing completed work.
-
-### Censor File Naming
-
-Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to prevent collisions when multiple analyses use different thresholds for the same task, and to make the threshold traceable from the filename alone.
 
 ## Edge Case Behavior
 
@@ -359,13 +355,14 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 | Subject has only 1 session on S3 | Processes that session only; summary shows 1 success |
 | Subject has no sessions on S3 | Raises `OrchestratorError` (fatal for that subject) |
 | Missing events file for a task run | Run is skipped with a warning; other runs proceed |
+| Missing motion file for a run | Run is skipped with a warning; other runs proceed |
 | Missing confounds or mask for a run | Run is skipped with a warning; other runs proceed |
 | All runs fail for a task | Task is skipped; other tasks proceed |
 | All tasks fail for a session | Session raises `OrchestratorError`; other sessions may still succeed |
 | One analysis fails (e.g., AFNI error) | Other analyses continue; QC JSON records the error |
 | All sessions fail for a subject | Subject-level `OrchestratorError` raised; exit code 1 in batch runner |
 | Single-run task with `concatenate_runs: true` | File is copied (not concatenated) — no 3dTcat overhead |
-| >50% volumes censored | Warning logged; analysis still attempted |
+| >50% volumes censored | Warning from upstream; analysis still attempted |
 | Non-steady-state TRs detected | Trimmed from BOLD, confounds, and timing; onsets adjusted |
 | Events with onset < 0 after NSS trim | Events dropped with warning |
 | Generic "cue" labels in n-back events | 0-back cues relabeled with bare stimulus condition; 2-back cues relabeled as "instruction" (when `fix_nback_cues: true`) |
@@ -397,7 +394,7 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 
 | File | Purpose |
 |------|---------|
-| `orchestrate_first_level.py` | Main per-subject pipeline: CLI, session loop, pipeline steps 0–14 |
+| `orchestrate_first_level.py` | Main per-subject pipeline: CLI, session loop, pipeline steps 0–13 |
 | `run_orchestrator.py` | Parallel batch runner: subject list parsing, ThreadPoolExecutor, progress display, summary CSV |
 | `orchestrator_utils.py` | All utility functions: S3 operations, file discovery, preprocessing, QC, config building, validation |
 | `example_orchestrator_config.yaml` | Annotated orchestrator config example for ABCD |
@@ -407,17 +404,18 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 
 | Section | Functions |
 |---------|-----------|
-| A: S3 Operations | `_get_s3_client`, `discover_available_sessions`, `download_session_data`, `extract_session_archive`, `upload_to_s3` |
+| A: S3 Operations | `_get_s3_client`, `discover_available_sessions`, `download_session_data`, `discover_local_mmps_files`, `extract_session_archive`, `upload_to_s3` |
 | B: AFNI Check | `verify_afni_installation` |
 | C: File Discovery | `discover_session_files` |
 | D: Decompression | `decompress_if_needed` |
 | E: Brain Masking | `apply_brain_mask` |
 | F: Non-Steady-State TR Handling | `detect_non_steady_state_trs`, `remove_initial_trs_bold`, `remove_initial_trs_tabular` |
-| G: Confounds Extraction | `extract_motion_regressors`, `generate_censor_file`, `extract_tissue_signals` |
+| G: Confounds Extraction | `extract_motion_regressors`, `extract_tissue_signals` |
 | H: Task Timing | `fix_nback_cue_labels`, `format_task_timing` |
 | I: Run Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing` |
 | J: Smoothing | `apply_smoothing` |
-| K: QC — Preprocessing | `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality`, `compute_preproc_qc`, `save_qc_json`, `compute_first_level_qc` |
+| J2: Mask Intersection | `compute_mask_intersection` |
+| K: QC — Preprocessing | `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality`, `compute_preproc_qc`, `save_qc_json`, `compute_first_level_qc`, `consolidate_session_qc` |
 | L: Config Building | `build_first_level_config`, `write_temp_config` |
 | M: Config Validation | `load_orchestrator_config`, `validate_proc_template` |
 | N: Output Compression/Cleanup | `compress_session_outputs`, `cleanup_local_inputs` |
@@ -434,13 +432,12 @@ Censor files include the FD threshold in the filename (`_censor_fd0.9.1D`) to pr
 | Step 5: Brain mask | `apply_brain_mask` |
 | Step 6: Preprocessing QC | `compute_preproc_qc`, `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality` |
 | Step 7: NSS TR removal | `detect_non_steady_state_trs`, `remove_initial_trs_bold` |
-| Step 8: Censor generation | `generate_censor_file` |
-| Step 9: Motion extraction | `extract_motion_regressors` |
-| Step 10: Tissue signals | `extract_tissue_signals` |
-| Step 11: Task timing | `fix_nback_cue_labels`, `format_task_timing` |
-| Step 12: Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing`, `apply_smoothing` |
-| Step 13: First-level analysis | `build_first_level_config`, `write_temp_config`, `compute_first_level_qc` |
-| Step 14: Compress/upload/cleanup | `compress_session_outputs`, `upload_to_s3`, `cleanup_local_inputs` |
+| Step 8: Motion extraction | `extract_motion_regressors` |
+| Step 9: Tissue signals | `extract_tissue_signals` |
+| Step 10: Task timing | `fix_nback_cue_labels`, `format_task_timing` |
+| Step 11: Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing`, `compute_mask_intersection`, `apply_smoothing` |
+| Step 12: First-level analysis | `build_first_level_config`, `write_temp_config`, `compute_first_level_qc`, `consolidate_session_qc` |
+| Step 13: Compress/upload/cleanup | `compress_session_outputs`, `upload_to_s3`, `cleanup_local_inputs` |
 
 ### Internal Data Structure: `processed_files`
 
@@ -451,9 +448,6 @@ The `processed_files` dict is the central data structure passed between pipeline
 processed_files["nback"] = {
     "bold": "/path/to/concat_bold.nii.gz",           # str
     "motion": "/path/to/concat_motion.1D",            # str
-    "censor": {                                        # dict: fd_threshold -> path
-        0.9: "/path/to/concat_censor_fd0.9.1D",
-    },
     "timing": "/path/to/concat_timing.csv",           # str or None
 }
 ```
@@ -463,18 +457,21 @@ processed_files["nback"] = {
 processed_files["rest"] = {
     "bolds": ["/path/run1.nii.gz", "/path/run2.nii.gz"],     # list of str
     "motions": ["/path/run1_motion.1D", "/path/run2_motion.1D"],
-    "censors": {                                               # dict: fd_threshold -> list of paths
-        0.4: ["/path/run1_censor_fd0.4.1D", "/path/run2_censor_fd0.4.1D"],
-    },
     "csf": ["/path/run1_csf.1D", "/path/run2_csf.1D"],
     "wm": ["/path/run1_wm.1D", "/path/run2_wm.1D"],
     "gs": ["/path/run1_gs.1D", "/path/run2_gs.1D"],          # list or None
 }
 ```
 
-### Note on Testing
+### Testing
 
-No automated test suite currently exists for this project. Validation is performed through `--dry-run` mode, per-run QC metrics, first-level QC checks, and log inspection.
+The `tests/` directory contains pytest test suites for validating orchestrator utility functions. Run with:
+
+```bash
+python -m pytest tests/ -v
+```
+
+Test outputs are written to a sandbox directory and cleaned up after each test run.
 
 ## Author
 

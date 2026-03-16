@@ -21,6 +21,7 @@
 
 global:
   num_cores: 1                   # CPU cores for AFNI parallel processing
+  tr: 0.8                        # Repetition time in seconds (must match study.TR in orchestrator config)
   template_path: null            # Path to shared ROI template (.nii.gz), or null
   force_diff_atlas: false        # true = allow atlas mismatch (USE WITH CAUTION)
 
@@ -39,12 +40,15 @@ analyses:
   - name: "nback_activation"
     type: "task_act"
 
+    # -- Per-analysis censoring parameters --
+    fd_threshold: 0.9            # Framewise displacement threshold (mm) for censoring
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+
     # -- Per-participant input file paths --
     paths:
       scan_path: "/path/to/subj001_nback_concat.nii.gz"
       task_timing_path: "/path/to/subj001_nback_timing.csv"
       motion_path: "/path/to/subj001_nback_motion.txt"
-      censor_path: "/path/to/subj001_nback_censor.txt"
       CSF_path: null             # mean CSF BOLD signal per TR, or null
       WM_path: null              # mean WM BOLD signal per TR, or null
 
@@ -89,11 +93,14 @@ analyses:
   - name: "nback_connectivity"
     type: "task_conn"
 
+    # -- Per-analysis censoring parameters --
+    fd_threshold: 0.9            # Framewise displacement threshold (mm) for censoring
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+
     paths:
       scan_path: "/path/to/subj001_nback_concat.nii.gz"
       task_timing_path: "/path/to/subj001_nback_timing.csv"
       motion_path: "/path/to/subj001_nback_motion.txt"
-      censor_path: "/path/to/subj001_nback_censor.txt"
       CSF_path: null            # mean CSF BOLD signal per TR, or null
       WM_path: null             # mean WM BOLD signal per TR, or null
 
@@ -123,6 +130,17 @@ analyses:
       conn_out_file_pre: "subj001_nback_baseline_Shen368"
       pcorr: false               # use partial correlation
       fishZ: true                # use Fisher Z transform on correlation coefficients
+      # -- Connectivity Contrasts --
+      # Linear combinations of condition-level connectivity outputs.
+      # Requires calc_conn != null. Conditions must reference entries in cond_beta_labels.
+      # functions: null = disabled; list of equations = enabled
+      contrasts:
+        functions:
+          - "1*stimFear-1*stimNeu"
+          - "1*stimSad-1*stimNeu"
+        labels:
+          - "Fear-Neutral"
+          - "Sad-Neutral"
 
   # ========================================================================
   # RESTING-STATE CONNECTIVITY (type: rest_conn)
@@ -133,6 +151,10 @@ analyses:
   - name: "rest_connectivity"
     type: "rest_conn"
 
+    # -- Per-analysis censoring parameters --
+    fd_threshold: 0.4            # Framewise displacement threshold (mm) for censoring
+    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+
     # -- Per-run input file paths (all lists must be the same length) --
     paths:
       scan_paths:
@@ -141,9 +163,6 @@ analyses:
       motion_paths:
         - "/path/to/subj001_rest_run1_motion.txt"
         - "/path/to/subj001_rest_run2_motion.txt"
-      censor_paths:
-        - "/path/to/subj001_rest_run1_censor.txt"
-        - "/path/to/subj001_rest_run2_censor.txt"
       CSF_paths:
         - "/path/to/subj001_rest_run1_CSF.txt"
         - "/path/to/subj001_rest_run2_CSF.txt"
