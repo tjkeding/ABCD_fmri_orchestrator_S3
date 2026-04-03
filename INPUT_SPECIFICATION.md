@@ -34,11 +34,13 @@ Required top-level sections: `study`, `tasks`, `analyses`. Optional sections: `s
 | `space` | str | Yes | — | fMRIPrep template space label (e.g., `MNI152NLin2009cAsym`). Must exactly match the `space-` entity in fMRIPrep output filenames. |
 | `TR` | float | Yes | — | Repetition time in seconds. Must be a positive number. Used for onset adjustment and clean time calculation. |
 | `calc_n_motion_derivs` | int | No | `1` | Number of temporal derivative sets for motion regressors. Total motion columns = `6 * (1 + calc_n_motion_derivs)`. Must be a non-negative integer. `0` = base parameters only (6 columns), `1` = base + first derivatives (12 columns), `2` = base + first + second derivatives (18 columns). |
+| `force_recompute` | bool | No | `false` | When `true`, all preprocessing steps recompute their outputs even if the output file already exists. When `false` (default), existing outputs are reused (idempotent re-run behavior). |
 
 **Validation rules:**
 - `fmriprep_dir`, `output_dir`, `space`, and `TR` must all be present and non-null
 - `TR` must be a positive number (`int` or `float`)
 - `calc_n_motion_derivs` must be a non-negative integer
+- `force_recompute` must be a boolean if present
 
 ### 2.2 `tasks` Block
 
@@ -421,18 +423,22 @@ generation, and motion-based QC metrics are performed exclusively by
 the upstream QC summary JSON and surfaced in the consolidated session QC output
 under `analyses.{name}.upstream_qc`.
 
-### Degree-to-Radian Conversion
+### Rotation Unit Handling
 
-Rotations in the raw motion.tsv are in degrees. **`extract_motion_regressors()`**
-converts them to radians (`np.deg2rad()`) before writing the output `.1D` file
-(AFNI convention).
+Rotations in the raw motion.tsv are in degrees. `extract_motion_regressors()` passes
+them through **without unit conversion** (no degree-to-radian conversion is applied),
+per the `fmri_first_level_proc` >= 2.4.0 input contract, which expects degrees and
+performs its own FD computation. A rotation unit ambiguity check is applied: if
+`max(abs(rotation)) <= 1.0` across all TRs (consistent with either sub-degree movement
+or data already in radians), the run is flagged as `rotation_unit_ambiguous=True` in
+the consolidated QC JSON for post-hoc review.
 
 ### Processing Flow
 
 1. Raw motion.tsv is downloaded from S3 (for ALL tasks including rest)
 2. `discover_session_files()` matches each motion file to its corresponding run via `motion_tsv_path`
-3. `extract_motion_regressors()` reads the raw motion.tsv, converts rotations to radians, computes numerical derivatives, and writes the output `.1D` file; this `.1D` file is passed to `fmri_first_level_proc`
-4. `fmri_first_level_proc` uses the motion `.1D` file along with `fd_threshold` and `censor_prev_tr` to generate censor files and compute FD-based QC metrics (reported in the upstream QC summary JSON)
+3. `extract_motion_regressors()` reads the raw motion.tsv, applies the rotation unit ambiguity check, computes numerical derivatives, imputes NaN values to 999.0 (guarantees censoring), and writes the output `.1D` file with rotations in degrees; this `.1D` file is passed to `fmri_first_level_proc`
+4. `fmri_first_level_proc` uses the motion `.1D` file along with `fd_threshold` and `censor_prev_tr` to convert rotations to radians, compute FD, generate censor files, and report motion-based QC metrics in the upstream QC summary JSON
 
 **Note:** FD is not computed by the orchestrator's preprocessing QC. Pre-analysis QC (computed by `compute_preproc_qc()`) contains only non-motion metrics (DVARS, tSNR, brain mask coverage, registration). Motion metrics are sourced from the upstream per-analysis QC summary produced by `fmri_first_level_proc`.
 
@@ -497,6 +503,7 @@ All validation checks performed at startup, with error message patterns and sour
 | S3 sessions non-empty list | `s3.available_sessions must be a non-empty list of session codes` | Yes |
 | S3 sessions are strings | `s3.available_sessions entries must be strings, got: {value}` | Yes |
 | calc_n_motion_derivs valid | `study.calc_n_motion_derivs must be a non-negative integer, got: {value}` | Yes |
+| force_recompute is boolean | `study.force_recompute must be a boolean, got: {value}` | Yes |
 | Deprecated fields in analysis | `[{name}] Field '{field}' in orchestrator analysis block is deprecated.` | Warning |
 
 ### Proc Template Cross-Validation (`validate_proc_template()`)
@@ -534,7 +541,7 @@ This file combines pre-analysis preprocessing QC (non-motion metrics) and per-an
 {
   "provenance": {
     "orchestrator_version": "3.1",
-    "fmri_first_level_proc_version": "2.3.0",
+    "fmri_first_level_proc_version": "2.4.0",
     "afni_version": "AFNI_24.0.01",
     "timestamp_utc": "2026-03-13T17:00:00+00:00",
     "sub_id": "NDARABC123",

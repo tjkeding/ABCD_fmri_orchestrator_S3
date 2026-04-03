@@ -571,8 +571,19 @@ def upload_to_s3(s3_config, sub_id, session, archive_path, logger):
 
 def verify_afni_installation(logger):
     """
-    Verify that AFNI is installed and on PATH by running 'afni -ver'.
-    Exits with error if AFNI is not found.
+    Verify that AFNI is installed and reachable on PATH.
+
+    Runs ``afni -ver`` as a subprocess. Logs the version string on success.
+    Called at startup when not in dry-run mode.
+
+    Parameters
+    ----------
+    logger : logging.Logger
+
+    Raises
+    ------
+    OrchestratorError
+        If AFNI is not found on PATH or if ``afni -ver`` exits non-zero.
     """
     try:
         result = subprocess.run(
@@ -877,10 +888,35 @@ def apply_brain_mask(bold_path, mask_path, out_dir, out_prefix, logger, force_re
     """
     Apply a brain mask to a BOLD file using AFNI's 3dcalc.
 
+    Uses the expression ``a*step(b)`` to zero out non-brain voxels.
+    Output filename: ``{out_prefix}_masked.nii.gz``. Idempotent — skips
+    computation if the output file already exists and ``force_recompute``
+    is False.
+
+    Parameters
+    ----------
+    bold_path : str
+        Path to the input BOLD NIfTI file.
+    mask_path : str
+        Path to the binary brain mask NIfTI file.
+    out_dir : str
+        Directory to write the masked BOLD file into.
+    out_prefix : str
+        Filename prefix for the output file.
+    logger : logging.Logger
+    force_recompute : bool, optional
+        If True, delete and recompute output even if it already exists.
+        Default False.
+
     Returns
     -------
     str
         Path to the masked BOLD file.
+
+    Raises
+    ------
+    OrchestratorError
+        If 3dcalc fails or produces no output.
     """
     out_path = os.path.join(out_dir, f"{out_prefix}_masked.nii.gz")
 
@@ -921,12 +957,20 @@ def detect_non_steady_state_trs(confounds_path, logger):
     """
     Detect non-steady-state TRs from fMRIPrep confounds file.
 
-    Counts columns matching 'non_steady_state_outlier_XX'.
+    Counts columns matching the prefix ``non_steady_state_outlier_``. Each
+    such column in the confounds TSV corresponds to one NSS TR that should
+    be removed from the beginning of the scan before first-level analysis.
+
+    Parameters
+    ----------
+    confounds_path : str
+        Path to the fMRIPrep confounds TSV file.
+    logger : logging.Logger
 
     Returns
     -------
     int
-        Number of non-steady-state TRs to remove.
+        Number of non-steady-state TRs to remove (0 if none detected).
     """
     confounds_df = pd.read_csv(confounds_path, sep="\t")
     nss_cols = [c for c in confounds_df.columns if c.startswith("non_steady_state_outlier")]
@@ -943,10 +987,36 @@ def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger, fo
     """
     Remove initial TRs from a BOLD file using AFNI's 3dTcat.
 
+    When ``n_remove == 0``, returns the input path unchanged (no 3dTcat call)
+    but still queries TR count via ``3dinfo -nv``. Output filename:
+    ``{out_prefix}_trimmed.nii.gz``. Idempotent — skips if output exists and
+    ``force_recompute`` is False.
+
+    Parameters
+    ----------
+    bold_path : str
+        Path to the masked BOLD NIfTI file.
+    n_remove : int
+        Number of initial TRs to remove (from detect_non_steady_state_trs).
+    out_dir : str
+        Directory to write the trimmed BOLD file into.
+    out_prefix : str
+        Filename prefix for the output file.
+    logger : logging.Logger
+    force_recompute : bool, optional
+        If True, delete and recompute output even if it already exists.
+        Default False.
+
     Returns
     -------
     tuple of (str, int)
-        (path to trimmed BOLD, number of TRs remaining)
+        (path to trimmed BOLD, number of TRs remaining after trimming).
+        The TR count is -1 if ``3dinfo`` fails.
+
+    Raises
+    ------
+    OrchestratorError
+        If 3dTcat fails or produces no output.
     """
     if n_remove == 0:
         # Get TR count from 3dinfo
@@ -1009,12 +1079,26 @@ def remove_initial_trs_bold(bold_path, n_remove, out_dir, out_prefix, logger, fo
 
 def remove_initial_trs_tabular(file_path, n_remove, out_path, logger):
     """
-    Remove initial rows from a tabular (text/tsv) file.
+    Remove initial rows from a tabular (whitespace-delimited text) file.
+
+    Used to trim confounds files or other tabular files to match a BOLD
+    timeseries after non-steady-state TR removal. When ``n_remove == 0``,
+    the file is copied to ``out_path`` unchanged.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the input tabular file (loaded via ``np.loadtxt``).
+    n_remove : int
+        Number of initial rows to remove.
+    out_path : str
+        Destination path for the trimmed output file.
+    logger : logging.Logger
 
     Returns
     -------
     tuple of (str, int)
-        (output path, number of rows remaining)
+        (output path, number of rows remaining after trimming).
     """
     if n_remove == 0:
         # Copy file as-is
@@ -1046,8 +1130,9 @@ def extract_motion_regressors(motion_tsv_path, n_remove, calc_n_motion_derivs, o
     Extract motion regressors from a raw motion TSV file.
 
     Reads the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the
-    raw motion.tsv file produced by mmps_mproc. Rotations are converted from
-    degrees to radians before writing the output .1D file (AFNI convention).
+    raw motion.tsv file produced by mmps_mproc. Output units: translations
+    in mm, rotations in degrees (per fmri-first-level-proc >= 2.4.0 input
+    contract). No unit conversion is applied.
 
     Temporal derivatives are always computed numerically via finite differences
     (padded with 0.0 at the first row to preserve length). Total output
@@ -1120,21 +1205,20 @@ def extract_motion_regressors(motion_tsv_path, n_remove, calc_n_motion_derivs, o
         # 14 additional runs across 3 participants) confirmed that some ABCD
         # subjects exhibit max rotations of 0.08–0.66 degrees throughout an
         # entire session. Raising a fatal error was overly conservative.
-        # Proceed with deg2rad conversion and flag for QC review.
+        # Pass through without conversion and flag for QC review.
         logger.warning(
             "Rotation unit check AMBIGUOUS for %s: "
             "max(abs(rotation)) = %.6f <= 1.0 across all TRs and axes. "
             "Units cannot be definitively determined (genuinely low-motion "
-            "subject or data already in radians). Proceeding with deg2rad "
-            "conversion. Run flagged as rotation_unit_ambiguous=True for "
-            "QC review.",
+            "subject or data already in radians). Proceeding WITHOUT "
+            "conversion (fmri-first-level-proc expects degrees). Run "
+            "flagged as rotation_unit_ambiguous=True for QC review.",
             motion_tsv_path, max_rot
         )
         rotation_unit_ambiguous = True
 
-    # Extract base parameters and convert rotations from degrees to radians
+    # Extract base parameters (rotations remain in degrees per fmri-first-level-proc >= 2.4.0 contract)
     motion_array = motion_df[base_cols].values.copy()
-    motion_array[:, 3:] = np.deg2rad(motion_array[:, 3:])
 
     # Build the motion array column by column
     arrays = [motion_array]  # shape (n_trs, 6)
@@ -1191,16 +1275,36 @@ def extract_tissue_signals(confounds_path, n_remove, tissue_type, out_path, logg
     """
     Extract a tissue/nuisance signal time series from fMRIPrep confounds.
 
+    Trims the initial ``n_remove`` rows (non-steady-state TRs) before writing
+    the output. Used for rest_conn analyses only; common tissue types are
+    ``"csf"``, ``"white_matter"``, and ``"global_signal"``. Idempotent —
+    skips if output exists and ``force_recompute`` is False.
+
     Parameters
     ----------
+    confounds_path : str
+        Path to the fMRIPrep confounds TSV file.
+    n_remove : int
+        Number of non-steady-state TRs to trim from the start.
     tissue_type : str
-        Column name in the confounds TSV. Common values:
-        "csf", "white_matter", "global_signal"
+        Column name in the confounds TSV. Accepted values:
+        ``"csf"``, ``"white_matter"``, ``"global_signal"``.
+    out_path : str
+        Destination path for the output signal file (plain text, one value per line).
+    logger : logging.Logger
+    force_recompute : bool, optional
+        If True, delete and recompute output even if it already exists.
+        Default False.
 
     Returns
     -------
     str
         Path to the tissue signal file.
+
+    Raises
+    ------
+    OrchestratorError
+        If the requested column is not found in the confounds TSV.
     """
     if os.path.isfile(out_path) and not force_recompute:
         logger.info("Tissue signal (%s) already exists: %s", tissue_type, out_path)
@@ -1328,17 +1432,45 @@ def fix_nback_cue_labels(events_path, condition_column, out_path, logger, force_
 
 
 def format_task_timing(events_path, condition_column, conditions_exclude, n_remove, TR, out_path, logger, force_recompute=False):
-
     """
     Convert BIDS events.tsv to first-level timing CSV (CONDITION, ONSET, DURATION).
 
-    Adjusts onsets for removed non-steady-state TRs and drops events that
-    occur during removed timepoints.
+    Adjusts event onsets for removed non-steady-state TRs
+    (``adjusted_onset = original_onset - n_remove * TR``) and drops events
+    with ``adjusted_onset < 0``. Optionally filters conditions via
+    ``conditions_exclude``. Idempotent — skips if output exists and
+    ``force_recompute`` is False.
+
+    Parameters
+    ----------
+    events_path : str
+        Path to the BIDS events TSV file (possibly relabeled by fix_nback_cue_labels).
+    condition_column : str
+        Column containing condition labels (typically ``"trial_type"``).
+    conditions_exclude : list of str or None
+        Conditions to drop before writing output. ``None`` = keep all.
+    n_remove : int
+        Number of non-steady-state TRs removed from the BOLD timeseries.
+    TR : float
+        Repetition time in seconds, used to compute the time offset.
+    out_path : str
+        Destination path for the output timing CSV.
+    logger : logging.Logger
+    force_recompute : bool, optional
+        If True, delete and recompute output even if it already exists.
+        Default False.
 
     Returns
     -------
     tuple of (str, int)
-        (path to timing CSV, number of events dropped due to onset adjustment)
+        (path to timing CSV, number of events dropped due to negative onset
+        after adjustment). Note: the drop count is 0 when returning from
+        cache (cached result does not re-compute the count).
+
+    Raises
+    ------
+    OrchestratorError
+        If required columns are missing or no events remain after filtering.
     """
     if os.path.isfile(out_path) and not force_recompute:
         logger.info("Task timing already exists: %s", out_path)
@@ -1688,10 +1820,28 @@ def compute_tsnr(bold_path, mask_path, out_dir, out_prefix, logger):
     """
     Compute temporal SNR (mean/stdev across time) within the brain mask.
 
+    Uses AFNI ``3dTstat`` to compute the mean and stdev volumes, then
+    computes tSNR voxelwise (``mean / max(stdev, 0.001)`` within mask)
+    via ``3dcalc``. Returns the median tSNR across brain voxels queried
+    with ``3dBrickStat -percentile 50``. Intermediate files (mean, stdev)
+    are deleted after use.
+
+    Parameters
+    ----------
+    bold_path : str
+        Path to the preprocessed BOLD NIfTI (after masking and NSS trimming).
+    mask_path : str
+        Path to the brain mask NIfTI.
+    out_dir : str
+        Directory to write intermediate tSNR volumes.
+    out_prefix : str
+        Filename prefix for intermediate output files.
+    logger : logging.Logger
+
     Returns
     -------
-    float
-        Median brain tSNR.
+    float or None
+        Median brain tSNR, or None if computation fails.
     """
     mean_path = os.path.join(out_dir, f"{out_prefix}_tsnr_mean.nii.gz")
     stdev_path = os.path.join(out_dir, f"{out_prefix}_tsnr_stdev.nii.gz")
@@ -1835,10 +1985,23 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
     """
     Compute Dice coefficient between functional and anatomical brain masks.
 
+    Resamples the anatomical mask to the functional mask grid via
+    ``3dresample -rmode NN`` before computing voxel overlap. The Dice
+    coefficient is defined as ``2 * |A ∩ B| / (|A| + |B|)``. Temporary
+    resampled and overlap files are cleaned up after use.
+
+    Parameters
+    ----------
+    func_mask_path : str
+        Path to the functional brain mask NIfTI.
+    anat_mask_path : str
+        Path to the anatomical brain mask NIfTI (may differ in resolution).
+    logger : logging.Logger
+
     Returns
     -------
     float or None
-        Dice coefficient (0-1), or None if computation fails.
+        Dice coefficient in [0, 1], or None if computation fails.
     """
     try:
         # Count voxels in func mask
@@ -1892,7 +2055,6 @@ def compute_registration_quality(func_mask_path, anat_mask_path, logger):
         return None
 
 def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove, qc_config, out_dir, sub_id, space, logger, anat_mask_path=None):
-
     """
     Compute pre-analysis preprocessing QC metrics for a single run.
 
@@ -2043,14 +2205,26 @@ def compute_preproc_qc(run_info, confounds_path, bold_path, mask_path, n_remove,
     return qc
 
 def save_qc_json(qc_metrics, out_path, logger):
-    """Save QC metrics dict to a JSON file."""
+    """
+    Save a QC metrics dict to a JSON file.
+
+    Creates parent directories as needed. Values not JSON-serializable by
+    default (e.g., numpy types) are converted to strings via ``default=str``.
+
+    Parameters
+    ----------
+    qc_metrics : dict
+        QC metrics dictionary to serialize.
+    out_path : str
+        Destination path for the JSON file.
+    logger : logging.Logger
+    """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(qc_metrics, f, indent=2, default=str)
     logger.info("QC metrics saved: %s", out_path)
 
 def compute_first_level_qc(analysis_name, analysis_type, out_dir, sub_id, out_file_pre, logger, error_msg=None):
-
     """
     Compute first-level analysis QC metrics.
 
@@ -2400,10 +2574,20 @@ def write_temp_config(config_dict, out_dir, sub_id, session, logger):
     """
     Write a generated first-level config dict to a YAML file.
 
+    Output filename: ``sub-{sub_id}_ses-{session}A_first_level_config.yaml``.
+    Creates the output directory if it does not exist.
+
     Parameters
     ----------
+    config_dict : dict
+        Config dictionary produced by build_first_level_config().
+    out_dir : str
+        Directory to write the YAML file into.
+    sub_id : str
+        Participant ID (e.g. "NDARABC123").
     session : str
         Session code (e.g. "00").
+    logger : logging.Logger
 
     Returns
     -------
@@ -2428,10 +2612,28 @@ def load_orchestrator_config(config_path, logger):
     """
     Load and validate the orchestrator YAML config.
 
+    Performs comprehensive validation of all required fields, types, and
+    cross-references (e.g., analysis task_labels must reference defined tasks).
+    Sets default values for optional fields (``force_recompute``,
+    ``calc_n_motion_derivs``, ``smoothing``, ``qc``, ``s3``). See
+    Section 9 of INPUT_SPECIFICATION.md for the complete validation rule table.
+
+    Parameters
+    ----------
+    config_path : str
+        Path to the orchestrator YAML configuration file.
+    logger : logging.Logger
+
     Returns
     -------
     dict
-        Validated config dictionary.
+        Validated and normalized config dictionary.
+
+    Raises
+    ------
+    OrchestratorError
+        On any validation failure (file not found, parse error, missing
+        required fields, type errors, constraint violations).
     """
     if not os.path.isfile(config_path):
         raise OrchestratorError(f"Orchestrator config not found: {config_path}")

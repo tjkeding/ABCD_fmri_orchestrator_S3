@@ -60,8 +60,9 @@ study:
   #   1 -> 12 columns (base + first derivatives)
   #   2 -> 18 columns (base + first + second derivatives)
   # Motion parameters are sourced from raw motion.tsv files (mmps_mproc on
-  # S3), not from fMRIPrep confounds. Rotations are converted from degrees
-  # to radians. Derivatives are always computed numerically via finite
+  # S3), not from fMRIPrep confounds. Rotations are passed through in their
+  # original units (degrees) per the fmri_first_level_proc >= 2.4.0 input
+  # contract. Derivatives are always computed numerically via finite
   # differences. fmri_first_level_proc truncates extra columns as needed.
   calc_n_motion_derivs: 1
 
