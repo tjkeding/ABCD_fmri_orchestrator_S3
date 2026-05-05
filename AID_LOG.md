@@ -30,8 +30,8 @@ ABCD_fmri_orchestrator_S3 is a software pipeline, not an analysis. The AI-assist
 
 Development utilized **Claude Code** (Anthropic), employing two model tiers:
 
-| Model | Role | Tasks |
-|-------|------|-------|
+| Model | Use Case | Tasks |
+|-------|----------|-------|
 | Claude Opus 4 | Analytical and review | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
 | Claude Sonnet 4 | Implementation | Code generation, test implementation, documentation drafting, and file management |
 
@@ -47,7 +47,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 3. **Implement (Plan + Build)** — Implementation proceeded in two sub-phases: (a) a technical specification mapping each approved change to specific code modifications with risk assessment, and (b) execution of the specification. All plans required human approval before code generation began.
 
-4. **Test** — Comprehensive test suite development covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology). The test suite comprises 274 tests (0 failures, 12 skipped) validated against simulated end-to-end pipeline runs (N=19 simulated sessions) and real ABCD data (N=30 subjects, 98.5% analysis success rate across 133 sessions).
+4. **Test** — Comprehensive test suite development covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology). The test suite comprises 275 tests (12 skipped) validated against simulated end-to-end pipeline runs (N=19 simulated sessions) and real ABCD data (N=30 subjects, 98.5% analysis success rate across 133 sessions).
 
 5. **Clean** — Code quality review for consistency, style, and maintainability.
 
@@ -102,3 +102,7 @@ Raw session transcripts are excluded for privacy reasons. The structured reports
 ## 8. Version History
 
 - **2026-04-03**: Initial AID_LOG.md created. `.aid/` directory initialized with sanitized `project_claude.md` and 25 development reports (brainstorm, critical review, clean review, implementation plans/builds, test reports, documentation reports). Orchestrator updated for `fmri_first_level_proc` >= 2.4.0 alignment (motion contract, new config parameters, documentation).
+
+- **2026-05-04**: Orchestrator aligned with `fmri_first_level_proc` >= 2.5.0. Documentation and configuration-template updates reflect the new opt-in sequenced denoising backend (`use_sequenced_bandpass`) for resting-state connectivity and the corrected DOF pre-flight regressor count. No orchestrator code changes were required: the new proc-template field is preserved verbatim via the deep-copy passthrough in `build_first_level_config`. ABCD production configs default `use_sequenced_bandpass: false` to preserve behavioral parity with the v2.4.0 N=30 cohort outputs. Test fixtures and golden config files updated; one new passthrough unit test added. Pre-publish LLM-attribution scrub gate enforced per project memory.
+
+- **2026-05-05**: Published v2.5.0 alignment cycle to GitHub. Seven development reports synced to `.aid/reports/` covering the v2.5.0 brainstorm, implementation plan and build, test design and run-suite, and two documentation passes. `.gitignore` extended with six explicit entries for in-progress work and local-only artifacts.

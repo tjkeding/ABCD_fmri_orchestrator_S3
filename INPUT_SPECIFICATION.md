@@ -184,6 +184,9 @@ All other fields in the proc template are passed through verbatim to the generat
 - Atlas/template paths
 - Extraction parameters (ROI definitions, average type, etc.)
 - Connectivity parameters (methods, thresholds, etc.)
+- Resting-state denoising backend toggle (`use_sequenced_bandpass`)
+
+**Note:** As of `fmri_first_level_proc` >= 2.5.0, the rest_conn block accepts an opt-in `use_sequenced_bandpass` boolean (default `false`). When `true`, upstream uses a Ciric-inspired six-step sequenced denoising pipeline (NTRP interpolation + decoupled BOLD and nuisance bandpass) and may write per-run intermediates to `_sequenced_intermediates/{run_label}/` inside the rest_conn output directory. Retention of these intermediates is coupled to the existing `keep_run_res_dtseries` flag: if `true`, intermediates are retained and bundled into the orchestrator session archive; if `false`, upstream deletes them after each run and they never reach archival. The orchestrator does not gate or filter intermediates separately. ABCD production configs default `use_sequenced_bandpass: false` to preserve behavioral parity with v2.4.0 outputs.
 
 ### Cross-Validation Rules (`validate_proc_template()`)
 
@@ -427,7 +430,7 @@ under `analyses.{name}.upstream_qc`.
 
 Rotations in the raw motion.tsv are in degrees. `extract_motion_regressors()` passes
 them through **without unit conversion** (no degree-to-radian conversion is applied),
-per the `fmri_first_level_proc` >= 2.4.0 input contract, which expects degrees and
+per the `fmri_first_level_proc` >= 2.5.0 input contract, which expects degrees and
 performs its own FD computation. A rotation unit ambiguity check is applied: if
 `max(abs(rotation)) <= 1.0` across all TRs (consistent with either sub-degree movement
 or data already in radians), the run is flagged as `rotation_unit_ambiguous=True` in
@@ -541,7 +544,7 @@ This file combines pre-analysis preprocessing QC (non-motion metrics) and per-an
 {
   "provenance": {
     "orchestrator_version": "3.1",
-    "fmri_first_level_proc_version": "2.4.0",
+    "fmri_first_level_proc_version": "2.5.0",
     "afni_version": "AFNI_24.0.01",
     "timestamp_utc": "2026-03-13T17:00:00+00:00",
     "sub_id": "NDARABC123",

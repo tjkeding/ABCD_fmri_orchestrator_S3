@@ -64,7 +64,7 @@ conda activate ABCD_fmri_orchestrator_S3
 3dinfo -ver
 ```
 
-The conda environment installs `fmri_first_level_proc` directly from GitHub via pip. **Requires `fmri_first_level_proc` >= 2.4.0.** See `environment.yaml` for the full dependency list.
+The conda environment installs `fmri_first_level_proc` directly from GitHub via pip. **Requires `fmri_first_level_proc` >= 2.5.0.** See `environment.yaml` for the full dependency list.
 
 ## Quick Start
 
@@ -194,7 +194,7 @@ Counts `non_steady_state_outlier_*` columns in the fMRIPrep confounds file to de
 
 ### Step 8: Extract Motion Regressors
 
-Extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the raw motion.tsv file (not fMRIPrep confounds). Rotations remain in degrees per the `fmri_first_level_proc` >= 2.4.0 input contract; no unit conversion is applied. Temporal derivatives are always computed numerically via finite differences (padded with 0.0 at the first row). Total output columns = `6 * (1 + calc_n_motion_derivs)`. NaN values indicate motion tracking failures and are imputed to 999.0, guaranteeing those TRs exceed any reasonable FD threshold and are censored by upstream `1d_tool.py`.
+Extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the raw motion.tsv file (not fMRIPrep confounds). Rotations remain in degrees per the `fmri_first_level_proc` >= 2.5.0 input contract; no unit conversion is applied. Temporal derivatives are always computed numerically via finite differences (padded with 0.0 at the first row). Total output columns = `6 * (1 + calc_n_motion_derivs)`. NaN values indicate motion tracking failures and are imputed to 999.0, guaranteeing those TRs exceed any reasonable FD threshold and are censored by upstream `1d_tool.py`.
 
 ### Step 9: Extract Tissue Signals (Rest Only)
 
@@ -342,7 +342,7 @@ Within a session, each analysis runs independently. If one analysis fails (e.g.,
 
 ### Motion Data from Raw Files
 
-All motion parameters, framewise displacement (FD), and motion derivatives are sourced from raw motion.tsv files (mmps_mproc), NOT from fMRIPrep's confounds_timeseries.tsv. This is because fMRIPrep's motion parameters in the confounds file do not include motion correction information. Rotations remain in degrees in the output `.1D` file per the `fmri_first_level_proc` >= 2.4.0 input contract; FD computation and radian conversion are handled exclusively by `fmri_first_level_proc`. DVARS, tissue signals, and non-steady-state detection remain sourced from confounds (derived from the BOLD signal, unaffected by motion source).
+All motion parameters, framewise displacement (FD), and motion derivatives are sourced from raw motion.tsv files (mmps_mproc), NOT from fMRIPrep's confounds_timeseries.tsv. This is because fMRIPrep's motion parameters in the confounds file do not include motion correction information. Rotations remain in degrees in the output `.1D` file per the `fmri_first_level_proc` >= 2.5.0 input contract; FD computation and radian conversion are handled exclusively by `fmri_first_level_proc`. DVARS, tissue signals, and non-steady-state detection remain sourced from confounds (derived from the BOLD signal, unaffected by motion source).
 
 ### Idempotent Outputs
 

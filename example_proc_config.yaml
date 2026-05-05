@@ -183,6 +183,7 @@ analyses:
     notch_filter_band: [0.31, 0.43]  # Respiration notch filter Hz band applied to motion before FD censoring (null = disabled)
     motion_deriv_degree: 2       # Required: number of derivative orders (total motion cols = 6 * degree); e.g. 2 = base + 1st derivs = 12 cols
     keep_run_res_dtseries: true  # true = keep all run-specific dtseries (false to save space)
+    use_sequenced_bandpass: false # true = use Ciric-inspired sequenced denoising (NTRP interpolation + decoupled BOLD/nuisance bandpass) for DOF-constrained cohorts; false = simultaneous denoising (default)
     use_tissue_derivs: true     # true = include first temporal derivatives of tissue signals (CSF/WM/GS) as additional regressors
 
     # -- Extraction --

@@ -16,3 +16,14 @@ raw_events_file_example.tsv
 raw_motion_file_example.tsv
 orch_config_final.yaml
 proc_config_final.yaml
+
+# Local-only artifacts (not for publication)
+.Rhistory
+tests/
+ABCD_first_level_test_N30.txt
+orchestrator_motion_changes_v2.4.0.md
+test_ids.txt
+REFACTOR_PLAN.md
+ABCD_fmri_orchestrator_S3_implement_plan_20260505_104940.md
+ABCD_fmri_orchestrator_S3_implement_build_20260505_120440.md
+ABCD_fmri_orchestrator_S3_document_20260505_195729.md
