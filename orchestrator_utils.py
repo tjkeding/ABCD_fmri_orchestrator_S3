@@ -19,6 +19,8 @@ import json
 import shutil
 import tarfile
 import subprocess
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
 import numpy as np
@@ -31,6 +33,16 @@ from botocore.exceptions import ClientError, NoCredentialsError
 
 class OrchestratorError(Exception):
     """Raised for unrecoverable orchestrator errors."""
+    pass
+
+
+class LegacyArchiveCorruptError(Exception):
+    """
+    Raised by migrate_session_from_archive when a legacy on-S3 tarball
+    cannot be migrated cleanly (tarfile.TarError on extract, or extracted
+    file set fails sanity checks). Caught by _process_session as a signal
+    to fall through to FULL processing per the Q8 routing decision tree.
+    """
     pass
 
 
@@ -56,6 +68,639 @@ def _get_s3_client():
             "AWS credentials not found. Configure credentials via environment "
             "variables, ~/.aws/credentials, or EC2 instance role."
         )
+
+
+def enumerate_upload_targets(session_out_dir, sub_id, session):
+    """
+    Walk the canonical session output tree and return the upload target list.
+
+    This is the single source of truth for the per-session expected key set
+    used by both upload (gap computation, verification) and routing consumers.
+
+    Parameters
+    ----------
+    session_out_dir : str
+        Local path to the session output directory.
+    sub_id : str
+        Participant ID (e.g. "NDARABC123").
+    session : str
+        Session code (e.g. "00").
+
+    Returns
+    -------
+    list of dict
+        Each dict has keys {"local_path": str, "s3_key_suffix": str,
+        "size_bytes": int}. s3_key_suffix is the path relative to
+        session_out_dir with os.sep replaced by "/" for forward-slash S3 keys.
+        The list is sorted by s3_key_suffix for deterministic ordering.
+    """
+    targets = []
+
+    # first_level_out/: full recursive walk, include all files
+    fl_out_dir = os.path.join(session_out_dir, "first_level_out")
+    if os.path.isdir(fl_out_dir):
+        for root, dirs, files in os.walk(fl_out_dir):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel = os.path.relpath(local_path, session_out_dir)
+                s3_key_suffix = rel.replace(os.sep, "/")
+                targets.append({
+                    "local_path": local_path,
+                    "s3_key_suffix": s3_key_suffix,
+                    "size_bytes": os.path.getsize(local_path),
+                })
+
+    # qc/: full recursive walk, include all files
+    qc_dir = os.path.join(session_out_dir, "qc")
+    if os.path.isdir(qc_dir):
+        for root, dirs, files in os.walk(qc_dir):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel = os.path.relpath(local_path, session_out_dir)
+                s3_key_suffix = rel.replace(os.sep, "/")
+                targets.append({
+                    "local_path": local_path,
+                    "s3_key_suffix": s3_key_suffix,
+                    "size_bytes": os.path.getsize(local_path),
+                })
+
+    # preproc/: single-level, files only, exclude *.nii.gz
+    preproc_dir = os.path.join(session_out_dir, "preproc")
+    if os.path.isdir(preproc_dir):
+        for fname in os.listdir(preproc_dir):
+            if fname.endswith(".nii.gz"):
+                continue
+            local_path = os.path.join(preproc_dir, fname)
+            if not os.path.isfile(local_path):
+                continue
+            rel = os.path.relpath(local_path, session_out_dir)
+            s3_key_suffix = rel.replace(os.sep, "/")
+            targets.append({
+                "local_path": local_path,
+                "s3_key_suffix": s3_key_suffix,
+                "size_bytes": os.path.getsize(local_path),
+            })
+
+    # concat/: single-level, files only, exclude *.nii.gz
+    concat_dir = os.path.join(session_out_dir, "concat")
+    if os.path.isdir(concat_dir):
+        for fname in os.listdir(concat_dir):
+            if fname.endswith(".nii.gz"):
+                continue
+            local_path = os.path.join(concat_dir, fname)
+            if not os.path.isfile(local_path):
+                continue
+            rel = os.path.relpath(local_path, session_out_dir)
+            s3_key_suffix = rel.replace(os.sep, "/")
+            targets.append({
+                "local_path": local_path,
+                "s3_key_suffix": s3_key_suffix,
+                "size_bytes": os.path.getsize(local_path),
+            })
+
+    targets.sort(key=lambda t: t["s3_key_suffix"])
+    return targets
+
+
+def _session_upload_prefix(s3_config, sub_id, session):
+    """
+    Return the per-session S3 prefix root (no trailing slash).
+
+    Returns f"{s3_config['upload_prefix']}/sub-{sub_id}/ses-{session}A".
+    Used by all S3 helpers to construct consistent per-session S3 key prefixes.
+    """
+    return f"{s3_config['upload_prefix']}/sub-{sub_id}/ses-{session}A"
+
+
+def check_session_complete(s3_config, sub_id, session, logger):
+    """
+    Check whether the per-session _COMPLETE sentinel exists on S3.
+
+    Parameters
+    ----------
+    s3_config : dict
+        The 's3' section of the orchestrator config.
+    sub_id : str
+        Participant ID.
+    session : str
+        Session code (e.g. "00").
+    logger : logging.Logger
+
+    Returns
+    -------
+    bool
+        True if the sentinel object is present; False if absent (404/NoSuchKey).
+
+    Raises
+    ------
+    ClientError
+        For any S3 error other than 404/NoSuchKey.
+    """
+    s3_client = _get_s3_client()
+    bucket = s3_config["bucket"]
+    sentinel_key = f"{_session_upload_prefix(s3_config, sub_id, session)}/_COMPLETE"
+    try:
+        s3_client.head_object(Bucket=bucket, Key=sentinel_key)
+        logger.debug("Sentinel found: s3://%s/%s", bucket, sentinel_key)
+        return True
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("404", "NoSuchKey"):
+            logger.debug("Sentinel absent: s3://%s/%s", bucket, sentinel_key)
+            return False
+        raise
+
+
+def delete_session_sentinel(s3_config, sub_id, session, logger):
+    """
+    Delete the per-session _COMPLETE sentinel from S3.
+
+    Idempotent: boto3 delete_object returns success for non-existent keys.
+
+    Parameters
+    ----------
+    s3_config : dict
+        The 's3' section of the orchestrator config.
+    sub_id : str
+        Participant ID.
+    session : str
+        Session code (e.g. "00").
+    logger : logging.Logger
+
+    Raises
+    ------
+    ClientError
+        Re-raised to the caller on any S3 error.
+    """
+    s3_client = _get_s3_client()
+    bucket = s3_config["bucket"]
+    sentinel_key = f"{_session_upload_prefix(s3_config, sub_id, session)}/_COMPLETE"
+    s3_client.delete_object(Bucket=bucket, Key=sentinel_key)
+    logger.info("Deleted sentinel: s3://%s/%s", bucket, sentinel_key)
+
+
+def determine_session_routing(s3_config, sub_id, session, force_recompute, logger):
+    """
+    Determine the routing path for a session: "skip", "migrate", or "full".
+
+    Performs up to three head_object calls (sentinel, force_recompute delete,
+    legacy tarball) and returns a routing decision with associated remote metadata.
+    Does NOT download anything; integrity is verified downstream by
+    migrate_session_from_archive.
+
+    Parameters
+    ----------
+    s3_config : dict
+        The 's3' section of the orchestrator config.
+    sub_id : str
+        Participant ID.
+    session : str
+        Session code (e.g. "00").
+    force_recompute : bool
+        If True, existing sentinel is deleted and routing returns "full".
+    logger : logging.Logger
+
+    Returns
+    -------
+    dict
+        Keys:
+          "routing": one of "skip", "migrate", "full".
+          "remote_metadata": dict with routing-specific artifact metadata.
+            - "skip": {"sentinel_last_modified": "<ISO8601>"}
+            - "migrate": {"source_tarball_etag": str, "source_tarball_size": int,
+                          "source_tarball_last_modified": str}
+            - "full": {}
+
+    Raises
+    ------
+    OrchestratorError
+        On unexpected S3 errors during routing probes.
+    """
+    s3_client = _get_s3_client()
+    bucket = s3_config["bucket"]
+
+    # Step 1: Check for existing sentinel
+    sentinel_present = check_session_complete(s3_config, sub_id, session, logger)
+    if sentinel_present:
+        if not force_recompute:
+            # Read sentinel head_object for LastModified
+            sentinel_key = f"{_session_upload_prefix(s3_config, sub_id, session)}/_COMPLETE"
+            resp = s3_client.head_object(Bucket=bucket, Key=sentinel_key)
+            last_modified_iso = resp["LastModified"].isoformat()
+            logger.info(
+                "Routing: SKIP for sub-%s ses-%s (sentinel last_modified=%s)",
+                sub_id, session, last_modified_iso
+            )
+            return {
+                "routing": "skip",
+                "remote_metadata": {"sentinel_last_modified": last_modified_iso},
+            }
+        else:
+            # force_recompute=True: delete sentinel and route FULL immediately
+            delete_session_sentinel(s3_config, sub_id, session, logger)
+            logger.info(
+                "force_recompute=True: deleted existing sentinel for sub-%s ses-%s; routing FULL",
+                sub_id, session
+            )
+            logger.info(
+                "Routing: FULL for sub-%s ses-%s (no prior outputs detected)",
+                sub_id, session
+            )
+            return {"routing": "full", "remote_metadata": {}}
+
+    # Step 2: Check for legacy tarball
+    tarball_key = f"{_session_upload_prefix(s3_config, sub_id, session)}/first_level_out.tar.gz"
+    try:
+        resp = s3_client.head_object(Bucket=bucket, Key=tarball_key)
+        etag = resp["ETag"]
+        size = resp["ContentLength"]
+        last_modified_iso = resp["LastModified"].isoformat()
+        logger.info(
+            "Routing: MIGRATE for sub-%s ses-%s (source tarball ETag=%s size=%d)",
+            sub_id, session, etag, size
+        )
+        return {
+            "routing": "migrate",
+            "remote_metadata": {
+                "source_tarball_etag": etag,
+                "source_tarball_size": size,
+                "source_tarball_last_modified": last_modified_iso,
+            },
+        }
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("404", "NoSuchKey"):
+            pass
+        else:
+            raise OrchestratorError(
+                f"Routing probe failed for {tarball_key}: {e}"
+            )
+
+    # Step 3: Neither sentinel nor tarball — route FULL
+    logger.info(
+        "Routing: FULL for sub-%s ses-%s (no prior outputs detected)",
+        sub_id, session
+    )
+    return {"routing": "full", "remote_metadata": {}}
+
+
+def upload_session_to_s3(s3_config, sub_id, session, session_out_dir, logger):
+    """
+    Upload a session's outputs to S3 using per-file parallel transfer.
+
+    Enumerates expected targets, diffs against the remote inventory, uploads
+    only the gap, verifies all expected keys post-upload, and writes a zero-byte
+    _COMPLETE sentinel only on a full verification pass.
+
+    Parameters
+    ----------
+    s3_config : dict
+        The 's3' section of the orchestrator config.
+    sub_id : str
+        Participant ID.
+    session : str
+        Session code (e.g. "00").
+    session_out_dir : str
+        Local path to the session output directory.
+    logger : logging.Logger
+
+    Returns
+    -------
+    dict
+        Keys: {"n_files_uploaded": int, "n_files_total": int,
+               "verified_keys": int, "sentinel_key": str}.
+
+    Raises
+    ------
+    OrchestratorError
+        On empty enumeration, stale sentinel at upload start, upload failure,
+        or post-upload verification failure.
+    """
+    prefix = _session_upload_prefix(s3_config, sub_id, session)
+    bucket = s3_config["bucket"]
+    max_workers = s3_config.get("upload_max_workers", 8)
+
+    # 1. Enumerate expected targets
+    targets = enumerate_upload_targets(session_out_dir, sub_id, session)
+    if len(targets) == 0:
+        raise OrchestratorError(
+            f"No upload targets enumerated for sub-{sub_id} ses-{session}A; "
+            f"cannot proceed."
+        )
+
+    # 2. Build expected-keys map
+    expected = {f"{prefix}/{t['s3_key_suffix']}": t for t in targets}
+
+    logger.info(
+        "Upload phase: sub-%s ses-%s, %d expected targets, max_workers=%d",
+        sub_id, session, len(expected), max_workers
+    )
+
+    # 3. Probe remote inventory
+    s3_client = _get_s3_client()
+    remote = {}
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
+        for obj in page.get("Contents", []):
+            remote[obj["Key"]] = obj["Size"]
+
+    sentinel_key = f"{prefix}/_COMPLETE"
+    if sentinel_key in remote:
+        raise OrchestratorError(
+            f"Stale sentinel present at upload start: {sentinel_key}. "
+            f"Caller did not clear it; aborting."
+        )
+
+    # 4. Compute upload gap
+    upload_list = []
+    already_present = 0
+    for expected_key, target in expected.items():
+        if expected_key in remote and remote[expected_key] == target["size_bytes"]:
+            already_present += 1
+        else:
+            upload_list.append((expected_key, target))
+
+    logger.info(
+        "Upload gap for sub-%s ses-%s: %d/%d files to upload (%d already present)",
+        sub_id, session, len(upload_list), len(expected), already_present
+    )
+
+    # 5. Parallel upload via ThreadPoolExecutor
+    n_uploaded = 0
+    failures = []
+    if upload_list:
+        future_to_target = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for expected_key, target in upload_list:
+                fut = ex.submit(
+                    s3_client.upload_file,
+                    target["local_path"],
+                    bucket,
+                    expected_key,
+                )
+                future_to_target[fut] = (expected_key, target)
+            for i, fut in enumerate(as_completed(future_to_target), start=1):
+                exp_key, target = future_to_target[fut]
+                try:
+                    fut.result()
+                    n_uploaded += 1
+                    if i % 10 == 0:
+                        logger.info(
+                            "%d/%d uploaded (sub-%s ses-%s)",
+                            i, len(upload_list), sub_id, session
+                        )
+                    else:
+                        logger.debug("Uploaded: %s", exp_key)
+                except Exception as e:
+                    failures.append((target, e))
+
+        if failures:
+            raise OrchestratorError(
+                f"S3 upload failed for {len(failures)} file(s) in "
+                f"sub-{sub_id} ses-{session}A; first failure: "
+                f"{failures[0][0]['s3_key_suffix']}: {failures[0][1]}"
+            )
+
+    # 6. Batched verification
+    final_remote = {}
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
+        for obj in page.get("Contents", []):
+            if obj["Key"] != sentinel_key:
+                final_remote[obj["Key"]] = obj["Size"]
+
+    missing = []
+    mismatched = []
+    for expected_key, target in expected.items():
+        if expected_key not in final_remote:
+            missing.append(expected_key)
+        elif final_remote[expected_key] != target["size_bytes"]:
+            mismatched.append(
+                (expected_key, target["size_bytes"], final_remote[expected_key])
+            )
+
+    if missing or mismatched:
+        raise OrchestratorError(
+            f"Post-upload verification failed for sub-{sub_id} ses-{session}A: "
+            f"{len(missing)} missing, {len(mismatched)} size mismatch; "
+            f"first missing: {missing[0] if missing else 'n/a'}; "
+            f"first mismatch: {mismatched[0] if mismatched else 'n/a'}"
+        )
+
+    logger.info(
+        "Verification pass: %d keys present with matching sizes",
+        len(expected)
+    )
+
+    # 7. Write sentinel (only on full verification pass)
+    s3_client.put_object(Bucket=bucket, Key=sentinel_key, Body=b"")
+    logger.info("Sentinel written: s3://%s/%s", bucket, sentinel_key)
+
+    # 8. Return
+    return {
+        "n_files_uploaded": len(upload_list),
+        "n_files_total": len(expected),
+        "verified_keys": len(expected),
+        "sentinel_key": sentinel_key,
+    }
+
+
+def migrate_session_from_archive(
+    s3_config, sub_id, session, session_out_dir, logger, source_tarball_etag
+):
+    """
+    Migrate a session from a legacy on-S3 tarball to the per-file layout.
+
+    Downloads the legacy first_level_out.tar.gz, extracts to a staging dir with
+    path-traversal guard, validates required arcname structure, stages files under
+    canonical subdirs, inserts a migration provenance key into the session QC JSON,
+    delegates to upload_session_to_s3, and deletes the legacy tarball from S3 on
+    success.
+
+    Parameters
+    ----------
+    s3_config : dict
+        The 's3' section of the orchestrator config.
+    sub_id : str
+        Participant ID.
+    session : str
+        Session code (e.g. "00").
+    session_out_dir : str
+        Local path to the session output directory.
+    logger : logging.Logger
+    source_tarball_etag : str
+        ETag of the legacy tarball from the routing result's remote_metadata;
+        avoids a duplicate head_object call inside this function.
+
+    Returns
+    -------
+    dict
+        Keys: {"n_files_migrated": int, "sentinel_key": str}.
+
+    Raises
+    ------
+    OrchestratorError
+        On download failure or upload failure.
+    LegacyArchiveCorruptError
+        On extraction failure or arcname sanity-check failure; caught by
+        _process_session to fall through to FULL processing.
+    """
+    ses_label = f"ses-{session}A"
+    archive_prefix = f"sub-{sub_id}_{ses_label}"
+    bucket = s3_config["bucket"]
+    tarball_key = f"{_session_upload_prefix(s3_config, sub_id, session)}/first_level_out.tar.gz"
+
+    logger.info(
+        "Migration start: sub-%s ses-%s, source ETag=%s",
+        sub_id, session, source_tarball_etag
+    )
+
+    # 1. Prepare directories
+    os.makedirs(session_out_dir, exist_ok=True)
+    for subdir in ("first_level_out", "qc", "preproc", "concat"):
+        os.makedirs(os.path.join(session_out_dir, subdir), exist_ok=True)
+    staging_dir = os.path.join(session_out_dir, "_migration_staging")
+    os.makedirs(staging_dir, exist_ok=True)
+    local_archive_path = os.path.join(session_out_dir, "legacy_archive.tar.gz")
+
+    # 2. Download legacy tarball
+    s3_client = _get_s3_client()
+    try:
+        s3_client.download_file(bucket, tarball_key, local_archive_path)
+    except ClientError as e:
+        raise OrchestratorError(
+            f"Failed to download legacy tarball {tarball_key}: {e}"
+        )
+    archive_size_mb = os.path.getsize(local_archive_path) / (1024 * 1024)
+    logger.info(
+        "Migration download complete: %s (%.1f MB)", tarball_key, archive_size_mb
+    )
+
+    # 3. Extract to staging with path-traversal guard
+    try:
+        with tarfile.open(local_archive_path, "r:gz") as tar:
+            target_real = os.path.realpath(staging_dir) + os.sep
+            all_members = tar.getmembers()
+            safe_members = []
+            for member in all_members:
+                member_path = os.path.realpath(
+                    os.path.join(staging_dir, member.name)
+                )
+                if (
+                    member_path.startswith(target_real)
+                    or member_path == target_real.rstrip(os.sep)
+                ):
+                    safe_members.append(member)
+            if len(safe_members) < len(all_members):
+                n_skipped = len(all_members) - len(safe_members)
+                logger.warning(
+                    "Skipped %d unsafe tar member(s) with path traversal in %s",
+                    n_skipped, local_archive_path
+                )
+            if not safe_members:
+                raise LegacyArchiveCorruptError(
+                    f"Legacy tarball {tarball_key} contained no safe members."
+                )
+            tar.extractall(path=staging_dir, members=safe_members)
+    except LegacyArchiveCorruptError:
+        raise
+    except tarfile.TarError as e:
+        raise LegacyArchiveCorruptError(
+            f"Failed to extract legacy tarball {tarball_key}: {e}"
+        )
+
+    # 4. Validate arcname structure
+    required_arcnames = [
+        f"{archive_prefix}_first_level_out",
+        f"{archive_prefix}_qc",
+    ]
+    for required in required_arcnames:
+        if not os.path.isdir(os.path.join(staging_dir, required)):
+            raise LegacyArchiveCorruptError(
+                f"Legacy tarball {tarball_key} missing required arcname(s); "
+                f"found at staging root: {os.listdir(staging_dir)}"
+            )
+
+    # 5. Stage files under canonical subdirs
+    arcname_to_subdir = [
+        (f"{archive_prefix}_first_level_out", "first_level_out"),
+        (f"{archive_prefix}_qc", "qc"),
+        (f"{archive_prefix}_preproc", "preproc"),
+        (f"{archive_prefix}_concat", "concat"),
+    ]
+    for src_arcname, dst_subdir in arcname_to_subdir:
+        src_path = os.path.join(staging_dir, src_arcname)
+        dst_path = os.path.join(session_out_dir, dst_subdir)
+        if os.path.isdir(src_path):
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+
+    # 6. Insert migration provenance key into staged session QC JSON (AI7)
+    qc_json_path = os.path.join(
+        session_out_dir, "qc",
+        f"sub-{sub_id}_{ses_label}_orchestrator_qc.json"
+    )
+    if os.path.isfile(qc_json_path):
+        try:
+            from orchestrate_first_level import __version__ as _orch_ver
+        except ImportError:
+            _orch_ver = "unknown"
+        with open(qc_json_path, "r") as fh:
+            qc_obj = json.load(fh)
+        qc_obj["migration"] = {
+            "status": "migrated_from_archive",
+            "source_tarball_etag": source_tarball_etag,
+            "migration_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "orchestrator_version_at_migration": _orch_ver,
+        }
+        tmp_path = qc_json_path + ".tmp"
+        with open(tmp_path, "w") as fh:
+            json.dump(qc_obj, fh, indent=2)
+        os.rename(tmp_path, qc_json_path)
+    else:
+        logger.warning(
+            "Legacy tarball lacked session QC JSON at %s; "
+            "migration provenance key not inserted.",
+            qc_json_path
+        )
+
+    # 7. Upload via per-file routine
+    try:
+        upload_result = upload_session_to_s3(
+            s3_config, sub_id, session, session_out_dir, logger
+        )
+    except Exception:
+        # Do NOT delete the legacy tarball on S3; leave it for re-attempt.
+        raise
+
+    # 8. Delete legacy tarball from S3 (only on successful sentinel write)
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=tarball_key)
+        logger.info(
+            "Legacy tarball deleted from S3: %s/%s", bucket, tarball_key
+        )
+    except ClientError as e:
+        logger.error(
+            "Failed to delete legacy tarball from S3 (non-fatal): %s/%s: %s",
+            bucket, tarball_key, str(e)
+        )
+
+    # 9. Cleanup local intermediates
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    try:
+        os.remove(local_archive_path)
+    except OSError as e:
+        logger.warning(
+            "Could not remove local legacy archive %s: %s",
+            local_archive_path, str(e)
+        )
+
+    # 10. Return
+    n_migrated = upload_result["n_files_uploaded"]
+    sentinel_key = upload_result["sentinel_key"]
+    logger.info(
+        "Migration complete: sub-%s ses-%s, %d files migrated, sentinel written",
+        sub_id, session, n_migrated
+    )
+    return {"n_files_migrated": n_migrated, "sentinel_key": sentinel_key}
 
 
 def discover_available_sessions(s3_config, sub_id, logger):
@@ -503,67 +1148,6 @@ def extract_session_archive(archive_path, target_dir, logger):
     )
     return extracted_dir
 
-
-def upload_to_s3(s3_config, sub_id, session, archive_path, logger):
-    """
-    Upload a session results archive to S3.
-
-    Uses boto3's multipart upload automatically for large files. Verifies the
-    upload by comparing the S3 object ContentLength to the local file size.
-
-    Parameters
-    ----------
-    s3_config : dict
-        The 's3' section of the orchestrator config.
-    sub_id : str
-        Participant ID.
-    session : str
-        Session code (e.g. "00").
-    archive_path : str
-        Local path to the .tar.gz archive created by compress_session_outputs().
-    logger : logging.Logger
-    """
-    if not os.path.isfile(archive_path):
-        raise FileNotFoundError(f"Archive not found for S3 upload: {archive_path}")
-
-    bucket = s3_config["bucket"]
-    upload_prefix = s3_config["upload_prefix"]
-    ses_label = f"ses-{session}A"
-    s3_key = f"{upload_prefix}/sub-{sub_id}/{ses_label}/first_level_out.tar.gz"
-
-    s3_client = _get_s3_client()
-
-    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-    logger.info(
-        "Uploading %s (%.1f MB) → s3://%s/%s",
-        os.path.basename(archive_path), size_mb, bucket, s3_key
-    )
-
-    try:
-        s3_client.upload_file(archive_path, bucket, s3_key)
-    except NoCredentialsError:
-        raise OrchestratorError(
-            "AWS credentials not found. Configure credentials before enabling S3."
-        )
-    except ClientError as e:
-        logger.error("S3 upload failed for %s: %s", archive_path, str(e))
-        raise
-
-    # Verify upload: compare remote ContentLength to local file size
-    response = s3_client.head_object(Bucket=bucket, Key=s3_key)
-    remote_size = response["ContentLength"]
-    local_size = os.path.getsize(archive_path)
-
-    if remote_size != local_size:
-        raise RuntimeError(
-            f"Upload size mismatch for {sub_id}: "
-            f"local={local_size} bytes, S3={remote_size} bytes "
-            f"(s3://{bucket}/{s3_key})"
-        )
-
-    logger.info(
-        "Upload verified: s3://%s/%s (%d bytes)", bucket, s3_key, remote_size
-    )
 
 # ============================================================================
 # Section B: AFNI Check
@@ -2367,8 +2951,6 @@ def consolidate_session_qc(sub_id, ses_label, session_status, session_wall_time,
     str
         Path to the written QC JSON file.
     """
-    from datetime import datetime, timezone
-
     # Resolve orchestrator version from the entry-point module constant.
     # Lazy import avoids circular dependency; fallback to "unknown" for
     # environments that import orchestrator_utils in isolation (e.g. tests).
@@ -2831,6 +3413,12 @@ def load_orchestrator_config(config_path, logger):
     config.setdefault("s3", {"enabled": False})
     config["s3"].setdefault("cleanup_after_upload", True)
     config["s3"].setdefault("available_sessions", [])
+    config["s3"].setdefault("upload_max_workers", 8)
+    umw = config["s3"]["upload_max_workers"]
+    if not isinstance(umw, int) or isinstance(umw, bool) or not (1 <= umw <= 64):
+        raise OrchestratorError(
+            f"s3.upload_max_workers must be an integer in [1, 64], got: {umw!r}"
+        )
 
     logger.info("Orchestrator config validated successfully.")
     return config
@@ -2967,100 +3555,8 @@ def validate_proc_template(orchestrator_config, proc_template, logger):
 
 
 # ============================================================================
-# Section N: Output Compression and Local Cleanup
+# Section N: Local Cleanup
 # ============================================================================
-
-def compress_session_outputs(sub_id, session, session_out_dir, logger):
-    """
-    Compress a session's outputs into a .tar.gz archive for S3 upload.
-
-    Includes:
-      - first_level_out/  — analysis results and per-analysis QC
-      - qc/               — orchestrator QC JSON, preprocessing QC, carpet
-                            plots, tSNR maps
-      - Small provenance files from preproc/ and concat/ (motion regressors,
-        events, timing CSVs, tissue regressors, intersection masks) — excludes
-        large intermediate BOLD NIfTI files (*.nii.gz) which are regenerable
-        from fMRIPrep data on S3.
-
-    The archive is written atomically via a temporary file to prevent
-    corruption.
-
-    Parameters
-    ----------
-    sub_id : str
-        Participant ID (e.g. "NDARABC123").
-    session : str
-        Session code (e.g. "00").
-    session_out_dir : str
-        Path to the session output directory (contains first_level_out/).
-    logger : logging.Logger
-
-    Returns
-    -------
-    str
-        Path to the created .tar.gz archive.
-    """
-    archive_path = os.path.join(session_out_dir, "first_level_out.tar.gz")
-
-    if os.path.isfile(archive_path):
-        size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-        logger.info(
-            "Archive already exists — skipping compression: %s (%.1f MB)",
-            archive_path, size_mb
-        )
-        return archive_path
-
-    fl_out_dir = os.path.join(session_out_dir, "first_level_out")
-    if not os.path.isdir(fl_out_dir):
-        raise FileNotFoundError(
-            f"first_level_out directory not found — cannot compress: {fl_out_dir}"
-        )
-
-    ses_label = f"ses-{session}A"
-    archive_prefix = f"sub-{sub_id}_{ses_label}"
-    tmp = archive_path + ".tmp"
-    try:
-        with tarfile.open(tmp, "w:gz") as tar:
-            # first_level_out/ — full directory
-            tar.add(fl_out_dir, arcname=f"{archive_prefix}_first_level_out")
-
-            # qc/ — full directory (QC JSONs, carpet plots, tSNR maps)
-            qc_dir = os.path.join(session_out_dir, "qc")
-            if os.path.isdir(qc_dir):
-                tar.add(qc_dir, arcname=f"{archive_prefix}_qc")
-
-            # preproc/ — small provenance files only (exclude *.nii.gz)
-            preproc_dir = os.path.join(session_out_dir, "preproc")
-            if os.path.isdir(preproc_dir):
-                for fname in sorted(os.listdir(preproc_dir)):
-                    if not fname.endswith(".nii.gz"):
-                        fpath = os.path.join(preproc_dir, fname)
-                        if os.path.isfile(fpath):
-                            tar.add(fpath, arcname=f"{archive_prefix}_preproc/{fname}")
-
-            # concat/ — small provenance files only (exclude *.nii.gz)
-            concat_dir = os.path.join(session_out_dir, "concat")
-            if os.path.isdir(concat_dir):
-                for fname in sorted(os.listdir(concat_dir)):
-                    if not fname.endswith(".nii.gz"):
-                        fpath = os.path.join(concat_dir, fname)
-                        if os.path.isfile(fpath):
-                            tar.add(fpath, arcname=f"{archive_prefix}_concat/{fname}")
-
-        os.rename(tmp, archive_path)
-    except Exception:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
-        raise
-
-    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
-    logger.info(
-        "Session %s compression complete: %s (%.1f MB)",
-        ses_label, archive_path, size_mb
-    )
-    return archive_path
-
 
 def cleanup_local_inputs(downloaded_paths, logger):
     """

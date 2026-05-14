@@ -130,12 +130,14 @@ If the `qc` section is omitted entirely, both preproc and first_level QC default
 | `upload_prefix` | str | If enabled | — | S3 key prefix for uploading results. No leading or trailing `/`. |
 | `cleanup_after_upload` | bool | No | `true` | If true, delete downloaded/extracted files after successful upload. |
 | `available_sessions` | list of str | If enabled | `[]` | Pool of session codes to probe (e.g., `["00", "02", "04", "06"]`). Must be a non-empty list of strings when S3 is enabled. |
+| `upload_max_workers` | int | No | `8` | Number of concurrent worker threads for per-file S3 upload. Boto3 S3 client is thread-safe. |
 
 **Validation rules:**
 - If `enabled: true`, `bucket`, `fmriprep_s3_prefix`, `mmps_mproc_s3_prefix`, and `upload_prefix` are all required and must be non-null
 - `bucket` must not start with `s3://`
 - All prefix fields must not start or end with `/`
 - `available_sessions` must be a non-empty list of strings
+- `upload_max_workers` must be an integer in [1, 64] if present
 
 ---
 
@@ -186,7 +188,7 @@ All other fields in the proc template are passed through verbatim to the generat
 - Connectivity parameters (methods, thresholds, etc.)
 - Resting-state denoising backend toggle (`use_sequenced_bandpass`)
 
-**Note:** As of `fmri_first_level_proc` >= 2.5.0, the rest_conn block accepts an opt-in `use_sequenced_bandpass` boolean (default `false`). When `true`, upstream uses a Ciric-inspired six-step sequenced denoising pipeline (NTRP interpolation + decoupled BOLD and nuisance bandpass) and may write per-run intermediates to `_sequenced_intermediates/{run_label}/` inside the rest_conn output directory. Retention of these intermediates is coupled to the existing `keep_run_res_dtseries` flag: if `true`, intermediates are retained and bundled into the orchestrator session archive; if `false`, upstream deletes them after each run and they never reach archival. The orchestrator does not gate or filter intermediates separately. ABCD production configs default `use_sequenced_bandpass: false` to preserve behavioral parity with v2.4.0 outputs.
+**Note:** As of `fmri_first_level_proc` >= 2.5.0, the rest_conn block accepts an opt-in `use_sequenced_bandpass` boolean (default `false`). When `true`, upstream uses a Ciric-inspired six-step sequenced denoising pipeline (NTRP interpolation + decoupled BOLD and nuisance bandpass) and may write per-run intermediates to `_sequenced_intermediates/{run_label}/` inside the rest_conn output directory. Retention of these intermediates is coupled to the existing `keep_run_res_dtseries` flag: if `true`, intermediates are retained in the session output tree and included in the per-file S3 upload; if `false`, upstream deletes them after each run and they never reach S3. The orchestrator does not gate or filter intermediates separately. ABCD production configs default `use_sequenced_bandpass: false` to preserve behavioral parity with v2.4.0 outputs.
 
 ### Cross-Validation Rules (`validate_proc_template()`)
 
@@ -291,15 +293,29 @@ Motion files are downloaded for **ALL tasks, including rest** (unlike events fil
 - Columns: `t_indx`, `rot_z`, `rot_x`, `rot_y`, `trans_z`, `trans_x`, `trans_y`
 - Column order is NOT guaranteed — the orchestrator always selects columns by name
 - `t_indx` = TR index (ignored during processing)
-- Rotations are in **degrees** (converted to radians by the orchestrator before writing `.1D` output)
+- Rotations are in **degrees**; no unit conversion is applied (written to `.1D` in degrees per the `fmri_first_level_proc` >= 2.4.0 input contract)
 - Translations are in **mm**
 
 ### Upload Target
 
-**S3 key pattern:**
+Session outputs are uploaded as individual files mirroring the local session output tree:
+
 ```
-{upload_prefix}/sub-{ID}/ses-{session}A/first_level_out.tar.gz
+{upload_prefix}/sub-{ID}/ses-{session}A/first_level_out/...
+{upload_prefix}/sub-{ID}/ses-{session}A/qc/...
+{upload_prefix}/sub-{ID}/ses-{session}A/preproc/...   (NIfTI files excluded)
+{upload_prefix}/sub-{ID}/ses-{session}A/concat/...    (NIfTI files excluded)
 ```
+
+After upload completes and is verified, a zero-byte sentinel is written at:
+
+```
+{upload_prefix}/sub-{ID}/ses-{session}A/_COMPLETE
+```
+
+Subsequent invocations skip sessions with a sentinel. Partial uploads resume idempotently (files already on S3 with matching size are not re-uploaded). Legacy `first_level_out.tar.gz` archives are auto-detected and rehosted in this layout on next re-touch (no reprocessing); the source tarball is deleted from S3 after migration.
+
+**Sentinel operator note:** Operators must not place objects named `_COMPLETE` under any session prefix; the orchestrator treats them as completion markers and will skip the session unless `force_recompute: true` is set.
 
 ---
 

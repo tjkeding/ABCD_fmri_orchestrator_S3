@@ -42,13 +42,15 @@ __version__ = "3.1"
 
 from orchestrator_utils import (
     OrchestratorError,
+    LegacyArchiveCorruptError,
     VALID_TASK_LABELS,
     discover_available_sessions,
     download_session_data,
     discover_local_mmps_files,
     extract_session_archive,
-    upload_to_s3,
-    compress_session_outputs,
+    determine_session_routing,
+    upload_session_to_s3,
+    migrate_session_from_archive,
     cleanup_local_inputs,
     verify_afni_installation,
     load_orchestrator_config,
@@ -76,30 +78,40 @@ from orchestrator_utils import (
 )
 
 
-def _derive_session_status(analysis_outcomes):
+def _derive_session_status(routing, analysis_outcomes):
     """
-    Derive a qualified session status from per-analysis outcome dicts.
+    Derive a qualified session status from the routing decision and (for the
+    FULL path) per-analysis outcome dicts.
 
     Parameters
     ----------
+    routing : str
+        One of "full", "skip", "migrate". From the dict returned by
+        _process_session.
     analysis_outcomes : list of dict
-        Each dict has at minimum a 'status' key with value "success" or "failed".
+        Per-analysis outcomes (populated only when routing == "full").
 
     Returns
     -------
     str
-        "success"  — all analyses succeeded
-        "partial"  — at least one analysis succeeded
-        "failed"   — no analyses ran or all analyses failed
+        "skipped"  — routing == "skip" (prior outputs satisfied, no work done)
+        "migrated" — routing == "migrate" (legacy tarball rehosted as per-file)
+        "success"  — routing == "full", all analyses succeeded
+        "partial"  — routing == "full", at least one analysis succeeded
+        "failed"   — routing == "full", no analyses ran or all analyses failed
     """
+    if routing == "skip":
+        return "skipped"
+    if routing == "migrate":
+        return "migrated"
+    # routing == "full"
     if not analysis_outcomes:
         return "failed"
-    elif all(o["status"] == "success" for o in analysis_outcomes):
+    if all(o["status"] == "success" for o in analysis_outcomes):
         return "success"
-    elif any(o["status"] == "success" for o in analysis_outcomes):
+    if any(o["status"] == "success" for o in analysis_outcomes):
         return "partial"
-    else:
-        return "failed"
+    return "failed"
 
 
 def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level, dry_run, logger, session_filter=None):
@@ -193,17 +205,19 @@ def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level
         session_error = None
 
         try:
-            analysis_outcomes = _process_session(
+            session_result = _process_session(
                 config, sub_id, session, proc_template,
                 skip_qc, skip_first_level, logger
             )
-
-            # Derive qualified session status from per-analysis outcomes
-            session_status = _derive_session_status(analysis_outcomes)
-
+            session_status = _derive_session_status(
+                session_result["routing"], session_result["analysis_outcomes"]
+            )
             session_results[session] = {
                 "status": session_status,
-                "analyses": analysis_outcomes,
+                "routing": session_result["routing"],
+                "analyses": session_result["analysis_outcomes"],
+                "qc_path": session_result["qc_path"],
+                "remote_metadata": session_result["remote_metadata"],
             }
 
         except OrchestratorError as e:
@@ -213,7 +227,10 @@ def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level
             )
             session_results[session] = {
                 "status": "failed",
+                "routing": "full",
                 "analyses": [],
+                "qc_path": None,
+                "remote_metadata": {},
                 "error": session_error,
             }
 
@@ -226,7 +243,10 @@ def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level
             )
             session_results[session] = {
                 "status": "failed",
+                "routing": "full",
                 "analyses": [],
+                "qc_path": None,
+                "remote_metadata": {},
                 "error": session_error,
             }
 
@@ -244,11 +264,20 @@ def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level
     n_success = 0
     n_partial = 0
     n_failed = 0
+    n_skipped = 0
+    n_migrated = 0
     for ses, result in session_results.items():
         ses_status = result["status"]
-        logger.info("  ses-%sA: %s", ses, ses_status)
+        routing = result.get("routing", "full")
+        # Banner line for the session
+        if routing == "skip":
+            logger.info("  ses-%sA: %s (skipped — prior outputs intact)", ses, ses_status)
+        elif routing == "migrate":
+            logger.info("  ses-%sA: %s (migrated from legacy archive)", ses, ses_status)
+        else:
+            logger.info("  ses-%sA: %s", ses, ses_status)
 
-        # Log per-analysis breakdown
+        # Per-analysis breakdown only for FULL path
         for outcome in result.get("analyses", []):
             if outcome["status"] == "success":
                 logger.info("    [OK]     %s (%.2fs)", outcome["name"], outcome["wall_time_seconds"])
@@ -261,15 +290,21 @@ def process_participant(config, sub_id, proc_template, skip_qc, skip_first_level
             n_success += 1
         elif ses_status == "partial":
             n_partial += 1
+        elif ses_status == "skipped":
+            n_skipped += 1
+        elif ses_status == "migrated":
+            n_migrated += 1
         else:
             n_failed += 1
     logger.info(
-        "Total: %d success, %d partial, %d failed out of %d session(s)",
-        n_success, n_partial, n_failed, len(session_results)
+        "Total: %d success, %d partial, %d skipped, %d migrated, %d failed "
+        "out of %d session(s)",
+        n_success, n_partial, n_skipped, n_migrated, n_failed,
+        len(session_results)
     )
     logger.info("=" * 70)
 
-    if n_success == 0 and n_partial == 0 and n_failed > 0:
+    if n_success == 0 and n_partial == 0 and n_skipped == 0 and n_migrated == 0 and n_failed > 0:
         raise OrchestratorError(
             f"All {n_failed} session(s) failed for sub-{sub_id}. "
             f"Check log for details."
@@ -280,17 +315,23 @@ def _process_session(config, sub_id, session, proc_template, skip_qc, skip_first
     """
     Process a single session through the full pipeline.
 
-    This is the core session-centric workflow:
-    1. Download session data from S3 (archive + events)
-    2. Extract archive
-    3. Discover files per task
-    4. Per-task preprocessing (mask, QC, NSS, motion, tissue, timing)
-    5. Concatenate or collect runs
-    6. Build first-level config
-    7. Run first-level analyses
-    8. Compress session outputs
-    9. Upload to S3
-    10. Cleanup local files
+    Routing pre-flight: probe S3 for prior outputs.
+      - SKIP: prior sentinel found and force_recompute=False; return immediately.
+      - MIGRATE: prior legacy tarball found; rehost as per-file layout and return.
+        (Falls through to FULL if the legacy tarball is corrupt.)
+      - FULL: no prior outputs (or force_recompute=True); run the full pipeline.
+
+    FULL pipeline steps:
+      1. Download session data from S3
+      2. Extract archive
+      3. Discover files per task
+      4. Per-task preprocessing (mask, QC, NSS, motion, tissue, timing)
+      5. Concatenate or collect runs
+      6. Build first-level config
+      7. Run first-level analyses
+      12b. Consolidated session QC JSON
+      13a. Per-file upload + sentinel
+      13b. Local cleanup
     """
     study = config["study"]
     task_defs = config["tasks"]
@@ -323,6 +364,81 @@ def _process_session(config, sub_id, session, proc_template, skip_qc, skip_first
     preproc_qc_by_run = {}
 
     try:
+        # ============================================================
+        # Routing pre-flight (only meaningful when S3 is enabled)
+        # ============================================================
+        routing = "full"
+        remote_metadata = {}
+        if s3_cfg.get("enabled", False):
+            routing_result = determine_session_routing(
+                s3_cfg, sub_id, session, force_recompute, logger
+            )
+            routing = routing_result["routing"]
+            remote_metadata = routing_result["remote_metadata"]
+
+        if routing == "skip":
+            logger.info(
+                "Session %s for sub-%s already complete on S3 "
+                "(sentinel last_modified=%s); skipping.",
+                ses_label, sub_id,
+                remote_metadata.get("sentinel_last_modified"),
+            )
+            return {
+                "routing": "skip",
+                "analysis_outcomes": [],
+                "qc_path": None,
+                "remote_metadata": remote_metadata,
+            }
+
+        if routing == "migrate":
+            logger.info(
+                "Session %s for sub-%s has legacy tarball on S3 "
+                "(ETag=%s); migrating to per-file layout.",
+                ses_label, sub_id,
+                remote_metadata.get("source_tarball_etag"),
+            )
+            try:
+                migrate_result = migrate_session_from_archive(
+                    s3_cfg, sub_id, session, session_out, logger,
+                    remote_metadata["source_tarball_etag"],
+                )
+                logger.info(
+                    "Session %s for sub-%s migrated: %d files; sentinel %s",
+                    ses_label, sub_id,
+                    migrate_result["n_files_migrated"],
+                    migrate_result["sentinel_key"],
+                )
+                # Cleanup local intermediates (same contract as FULL path)
+                if s3_cfg.get("cleanup_after_upload", True):
+                    if os.path.isdir(session_out):
+                        shutil.rmtree(session_out, ignore_errors=True)
+                        logger.info("Removed session output directory: %s", session_out)
+                return {
+                    "routing": "migrate",
+                    "analysis_outcomes": [],
+                    "qc_path": None,
+                    "remote_metadata": remote_metadata,
+                }
+            except LegacyArchiveCorruptError as e:
+                logger.warning(
+                    "Legacy tarball for sub-%s ses-%s is corrupt: %s. "
+                    "Falling through to FULL processing.",
+                    sub_id, ses_label, str(e)
+                )
+                # Reset routing to FULL; clean staging from any partial migration
+                routing = "full"
+                # Best-effort cleanup of staging dir if migration partially executed
+                staging_dir = os.path.join(session_out, "_migration_staging")
+                if os.path.isdir(staging_dir):
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                legacy_archive = os.path.join(session_out, "legacy_archive.tar.gz")
+                if os.path.isfile(legacy_archive):
+                    try:
+                        os.remove(legacy_archive)
+                    except OSError:
+                        pass
+                # Fall through to Step 1 (FULL processing) below
+
         # ============================================================
         # Step 1: Download session data from S3
         # ============================================================
@@ -759,9 +875,10 @@ def _process_session(config, sub_id, session, proc_template, skip_qc, skip_first
         # ============================================================
         # Step 12b: Consolidated session QC JSON
         # ============================================================
+        qc_path = None
         if not skip_qc and (preproc_qc_by_run or analysis_outcomes):
             # Derive session status for QC JSON
-            qc_session_status = _derive_session_status(analysis_outcomes)
+            qc_session_status = _derive_session_status("full", analysis_outcomes)
 
             qc_json_path = os.path.join(
                 session_out, "qc",
@@ -772,25 +889,27 @@ def _process_session(config, sub_id, session, proc_template, skip_qc, skip_first
                 sub_id, ses_label, qc_session_status, session_wall_time,
                 preproc_qc_by_run, analysis_outcomes, qc_json_path, logger
             )
+            qc_path = qc_json_path
 
         # ============================================================
-        # Step 13: Compress, upload, cleanup
+        # Step 13: Per-file upload + sentinel + local cleanup
         # ============================================================
         if s3_cfg.get("enabled", False) and processed_files:
-            logger.info("Step 13a: Compressing session outputs...")
-            archive_path = compress_session_outputs(sub_id, session, session_out, logger)
-
-            logger.info("Step 13b: Uploading results archive to S3...")
-            upload_to_s3(s3_cfg, sub_id, session, archive_path, logger)
+            logger.info("Step 13a: Uploading session outputs (per-file) to S3...")
+            upload_result = upload_session_to_s3(
+                s3_cfg, sub_id, session, session_out, logger
+            )
+            logger.info(
+                "Step 13a complete: %d files uploaded, sentinel at %s",
+                upload_result["n_files_uploaded"], upload_result["sentinel_key"]
+            )
 
             if s3_cfg.get("cleanup_after_upload", True):
-                logger.info("Step 13c: Cleaning up local files...")
+                logger.info("Step 13b: Cleaning up local files...")
                 cleanup_local_inputs(downloaded_paths, logger)
-                # Clean up extracted fmriprep directory
                 if extracted_dir and os.path.isdir(extracted_dir):
                     shutil.rmtree(extracted_dir, ignore_errors=True)
                     logger.info("Removed extracted directory: %s", extracted_dir)
-                # Clean up session output directory (all outputs are in S3 archive)
                 if os.path.isdir(session_out):
                     shutil.rmtree(session_out, ignore_errors=True)
                     logger.info("Removed session output directory: %s", session_out)
@@ -808,7 +927,12 @@ def _process_session(config, sub_id, session, proc_template, skip_qc, skip_first
         raise
 
     logger.info("Session %s complete for sub-%s", ses_label, sub_id)
-    return analysis_outcomes
+    return {
+        "routing": "full",
+        "analysis_outcomes": analysis_outcomes,
+        "qc_path": qc_path,
+        "remote_metadata": remote_metadata,
+    }
 
 
 def main():

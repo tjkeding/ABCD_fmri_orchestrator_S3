@@ -37,7 +37,7 @@ run_orchestrator.py
           ├── Step 11: Concatenate runs (task) or collect per-run (rest)
           │             + optional spatial smoothing
           ├── Step 12: Build first-level config & run analyses
-          └── Step 13: Compress outputs → upload to S3 → cleanup
+          └── Step 13: Upload outputs (per-file) to S3 → write _COMPLETE sentinel → cleanup
 ```
 
 ## Prerequisites and Installation
@@ -212,9 +212,11 @@ For tasks with `concatenate_runs: true` (default for non-rest tasks): concatenat
 
 Deep-copies the proc template config and overrides only subject-specific fields (paths, output directories, session-aware prefixes). Injects `global.tr` from `study.TR` if not already present (validates match if present). Injects per-analysis `fd_threshold` and `censor_prev_tr` fields; censoring is handled automatically by `fmri_first_level_proc`. The orchestrator changes the working directory to the session output directory before running AFNI to prevent `3dDeconvolve.err` file collisions between concurrent sessions. Each analysis runs independently — if one fails, others continue. First-level QC reads the upstream QC summary JSON produced by `fmri_first_level_proc` for censor statistics and other metrics. After all analyses complete, a consolidated session-level QC JSON (`orchestrator_qc.json`) is written, combining pre-analysis preprocessing metrics with per-analysis status and upstream motion metrics.
 
-### Step 13: Compress, Upload, Cleanup
+### Step 13: Upload (Per-File), Sentinel, Cleanup
 
-When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive using atomic writes (temp file + rename), (b) uploads to S3 with size verification, (c) cleans up downloaded and extracted files if `s3.cleanup_after_upload` is true. Cleanup also runs on session failure to free disk space.
+When S3 is enabled, output files are uploaded in parallel under the per-session prefix; files already on S3 with matching size are skipped. A zero-byte `_COMPLETE` sentinel is written after verification. Local cleanup follows if `s3.cleanup_after_upload` is true (also runs on session failure).
+
+Subsequent invocations skip sessions with a `_COMPLETE` sentinel; partial uploads resume by re-uploading only missing or size-mismatched files.
 
 ## Output Directory Structure
 
@@ -246,11 +248,12 @@ When S3 is enabled: (a) compresses `first_level_out/` into a `.tar.gz` archive u
 │   │   └── sub-{ID}_ses-{session}A_task-{task}_run-{N}_carpet.png
 │   └── sub-{ID}_ses-{session}A_orchestrator_qc.json      # Consolidated session QC JSON
 │
-├── sub-{ID}_ses-{session}A_first_level_config.yaml       # Generated proc config
-└── first_level_out.tar.gz                                # Compressed archive for S3 upload
+└── sub-{ID}_ses-{session}A_first_level_config.yaml       # Generated proc config
 ```
 
-The uploaded S3 archive (`first_level_out.tar.gz`) includes: (1) the full `first_level_out/` directory, (2) the `qc/` directory (QC JSON, carpet plots, tSNR maps), (3) provenance files from `preproc/` and `concat/` (motion `.1D`, timing CSVs, tissue signal files, intersection masks) — large intermediate BOLD NIfTI files (`.nii.gz`) are excluded as they are regenerable from the fMRIPrep archive on S3. The generated session config YAML remains on the local filesystem only.
+The per-file S3 upload mirrors this local tree under `s3://{bucket}/{upload_prefix}/sub-{ID}/ses-{session}A/`, excluding large intermediate BOLD NIfTI files (regenerable from fMRIPrep). The `_COMPLETE` sentinel is written directly to S3 at the per-session prefix root after upload verification.
+
+Legacy `first_level_out.tar.gz` archives from prior versions are auto-migrated (see below).
 
 ## Quality Control
 
@@ -306,7 +309,8 @@ sessions = [json.load(open(f)) for f in qc_files]
 |------|----------------|
 | fMRIPrep archive | `{fmriprep_s3_prefix}/sub-{ID}/ses-{session}A/sub-{ID}_ses-{session}A_fmriprep-output.tar.gz` |
 | Events files | `{mmps_mproc_s3_prefix}/sub-{ID}/ses-{session}A/func/sub-{ID}_ses-{session}A_task-{task}_run-0{N}_events.tsv` |
-| Upload target | `{upload_prefix}/sub-{ID}/ses-{session}A/first_level_out.tar.gz` |
+| Upload target (per-file) | `{upload_prefix}/sub-{ID}/ses-{session}A/{first_level_out,qc,preproc,concat}/...` |
+| Completion sentinel | `{upload_prefix}/sub-{ID}/ses-{session}A/_COMPLETE` |
 
 Session labels follow the format `ses-{code}A` where `{code}` is a session code from `s3.available_sessions` (e.g., `ses-00A`, `ses-02A`, `ses-04A`, `ses-06A`). The "A" suffix is a study convention for the ABCD dataset.
 
@@ -317,6 +321,13 @@ Session labels follow the format `ses-{code}A` where `{code}` is a session code 
 - `s3.mmps_mproc_s3_prefix` — prefix for events files (e.g., `mmps_mproc`)
 - `s3.upload_prefix` — prefix for uploading results (e.g., `derivatives/fmriprep`)
 - `s3.available_sessions` — pool of session codes to probe (e.g., `["00", "02", "04", "06"]`)
+- `s3.upload_max_workers` — number of concurrent worker threads for per-file S3 upload (default `8`, valid range `[1, 64]`, integer); boto3 S3 client is thread-safe and one client is shared across all workers
+
+### Legacy Archive Auto-Migration
+
+Legacy `first_level_out.tar.gz` archives are auto-detected and rehosted in the per-file layout on next re-touch (no reprocessing; byte-equivalent outputs preserved). The source tarball is deleted from S3 after successful migration, and a `_COMPLETE` sentinel is written to the per-session prefix.
+
+Migrated sessions carry a top-level `migration` block in the orchestrator QC JSON (source ETag, UTC timestamp, orchestrator version) for provenance auditing.
 
 ## Design Decisions
 
@@ -404,7 +415,7 @@ Every processing step checks whether its output file already exists before runni
 
 | Section | Functions |
 |---------|-----------|
-| A: S3 Operations | `_get_s3_client`, `discover_available_sessions`, `download_session_data`, `discover_local_mmps_files`, `extract_session_archive`, `upload_to_s3` |
+| A: S3 Operations | `_get_s3_client`, `enumerate_upload_targets`, `check_session_complete`, `delete_session_sentinel`, `determine_session_routing`, `discover_available_sessions`, `download_session_data`, `discover_local_mmps_files`, `extract_session_archive`, `upload_session_to_s3`, `migrate_session_from_archive` |
 | B: AFNI Check | `verify_afni_installation` |
 | C: File Discovery | `discover_session_files` |
 | D: Decompression | `decompress_if_needed` |
@@ -418,7 +429,7 @@ Every processing step checks whether its output file already exists before runni
 | K: QC — Preprocessing | `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality`, `compute_preproc_qc`, `save_qc_json`, `compute_first_level_qc`, `consolidate_session_qc` |
 | L: Config Building | `build_first_level_config`, `write_temp_config` |
 | M: Config Validation | `load_orchestrator_config`, `validate_proc_template` |
-| N: Output Compression/Cleanup | `compress_session_outputs`, `cleanup_local_inputs` |
+| N: Output Cleanup | `cleanup_local_inputs` |
 
 ### Function-to-Pipeline-Step Mapping
 
@@ -437,7 +448,7 @@ Every processing step checks whether its output file already exists before runni
 | Step 10: Task timing | `fix_nback_cue_labels`, `format_task_timing` |
 | Step 11: Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing`, `compute_mask_intersection`, `apply_smoothing` |
 | Step 12: First-level analysis | `build_first_level_config`, `write_temp_config`, `compute_first_level_qc`, `consolidate_session_qc` |
-| Step 13: Compress/upload/cleanup | `compress_session_outputs`, `upload_to_s3`, `cleanup_local_inputs` |
+| Step 13: Upload/sentinel/cleanup | `enumerate_upload_targets`, `upload_session_to_s3`, `cleanup_local_inputs` |
 
 ### Internal Data Structure: `processed_files`
 

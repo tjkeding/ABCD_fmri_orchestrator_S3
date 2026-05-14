@@ -238,6 +238,10 @@ analyses:
 # cleanup_after_upload — if true, delete downloaded/extracted files after
 #                        successful upload (saves disk on EC2)
 # available_sessions   — pool of possible session codes to probe on S3
+#
+# Per-file upload pattern: s3://{bucket}/{upload_prefix}/sub-{ID}/ses-{NN}A/...
+# A zero-byte _COMPLETE sentinel marks each successfully uploaded session prefix.
+# Legacy single-archive uploads (first_level_out.tar.gz) are auto-migrated on re-touch.
 s3:
   enabled: true
   bucket: "abcd-v6"
@@ -246,3 +250,7 @@ s3:
   upload_prefix: "derivatives/fmriprep"
   cleanup_after_upload: true
   available_sessions: ["00", "02", "04", "06"]
+
+  # Number of concurrent worker threads for per-file S3 upload.
+  # Default 8; valid range [1, 64]. Boto3 S3 client is thread-safe.
+  upload_max_workers: 8
