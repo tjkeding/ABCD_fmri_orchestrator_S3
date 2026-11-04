@@ -1,13 +1,6 @@
 # ============================================================================
-# Conda environment for ABCD_fmri_orchestrator_S3
-# ============================================================================
-#
-# Create:  conda env create -f environment.yaml
-# Activate: conda activate ABCD_fmri_orchestrator_S3
-# Update:  conda env update -f environment.yaml --prune
-#
-# NOTE: AFNI must be installed separately (not available via conda-forge).
-#       See https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html
+# Conda environment for ABCD_fmri_orchestrator_S3 (conda env create -f environment.yaml)
+# AFNI is installed separately: https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html
 # ============================================================================
 
 name: ABCD_fmri_orchestrator_S3
@@ -17,13 +10,15 @@ channels:
   - defaults
 
 dependencies:
-  - python>=3.8
-  - numpy
-  - pandas
+  - python=3.14
+  - numpy=2.4.2
+  - pandas=3.0.1
+  - nibabel        # NIfTI I/O for test fixtures (not used in production code)
   - pyyaml
   - matplotlib     # QC carpet plots and tSNR visualization
   - boto3          # AWS S3 data transfer
+  - packaging      # PEP 440 upstream version comparison
   - pip
   - pip:
-    # Install the first-level package from GitHub (update URL when repo is published)
-    - "git+https://github.com/tjkeding/fmri_first_level_proc.git"
+    # fmri-first-level-proc from GitHub; the orchestrator requires >= 4.0.0 and < 5.0.0
+    - "git+https://github.com/tjkeding/fmri_first_level_proc.git@v4.0.0"

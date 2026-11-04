@@ -1,0 +1,37 @@
+<test_report>
+  <meta project="ABCD_fmri_orchestrator_S3" mode="test" timestamp="2026-10-01T11:10:00Z" />
+  <pre_design_run>
+    <total>334</total>
+    <passed>322</passed>
+    <failed>0</failed>
+    <errors>0</errors>
+    <coverage_pct></coverage_pct>
+    <failures>
+    </failures>
+  </pre_design_run>
+  <failing_test_dispositions>
+  </failing_test_dispositions>
+  <design_phase>
+    <tests_created>0</tests_created>
+    <tests_modified>0</tests_modified>
+    <files_created>
+    </files_created>
+    <design_rationale>No failing tests required disposition (pre-design run was clean). Coverage-gap analysis of the five fixture changes applied by the preceding implement build (mock load_and_validate return shape, mock dispatch FirstLevelResult return, two _process_session call sites, BIDS TSV timing contract, unconditional upstream_qc assertion) found no untested edge case: production code was not modified by the build, and the FirstLevelResult warnings-propagation paths (empty-default and non-empty/high-severity) are already covered independently in tests/test_cr_implementation_extended.py (lines 735-775, 1065-1070), which uses its own mock unrelated to the fixture just repaired. No new test files or modifications were written. Per explicit user direction, the post-design run_suite step was skipped as redundant since no files were changed in this phase; the pre-design run stands as the final result for this report.</design_rationale>
+  </design_phase>
+  <post_design_run>
+    <total>334</total>
+    <passed>322</passed>
+    <failed>0</failed>
+    <errors>0</errors>
+    <coverage_pct></coverage_pct>
+    <failures>
+    </failures>
+  </post_design_run>
+  <summary>
+    <assertions_preserved_or_strengthened>true</assertions_preserved_or_strengthened>
+    <bugs_routed_to_implement>0</bugs_routed_to_implement>
+    <recommendation>proceed_to_document</recommendation>
+  </summary>
+  <action_items>
+  </action_items>
+</test_report>

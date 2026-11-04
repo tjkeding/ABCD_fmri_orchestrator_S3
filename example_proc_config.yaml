@@ -1,200 +1,301 @@
 # ============================================================================
-# EXAMPLE YAML CONFIG FOR fMRI FIRST-LEVEL PROCESSING
+# fmri-first-level-proc template for the ABCD orchestrator (--proc_config); option reference:
+# INPUT_SPECIFICATION.md in https://github.com/tjkeding/fmri-first-level-proc
 # ============================================================================
-#
-# Usage:
-#   run-first-level --config example_config.yaml --dry-run
-#   run-first-level --config example_config.yaml
-#   run-first-level --config example_config.yaml --analyses 0 2
-#      --analyses 0 2 => only first and third analysis blocks will be run
-#
-# This file demonstrates all three analysis types with every available option.
-# Replace placeholder paths with real file paths before running.
-
+# Settings are used as written; the orchestrator fills only __ORCHESTRATOR_FILLED__ fields and run_labels.
+# Address outputs by contrast label, never sub-brick index (activation and connectivity statistics differ).
 # ============================================================================
 
-# --------------------------------------------------------------------------
-# GLOBAL SETTINGS
-# --------------------------------------------------------------------------
-# These values apply uniformly to all analysis blocks. They cannot be
-# overridden per-block.
-
+# ============================================================================
+# global
+# ============================================================================
 global:
-  num_cores: 1                   # CPU cores for AFNI parallel processing
-  tr: 0.8                        # Repetition time in seconds (must match study.TR in orchestrator config)
-  template_path: null            # Path to shared ROI template (.nii.gz), or null
-  force_diff_atlas: false        # true = allow atlas mismatch (USE WITH CAUTION)
+  tr: 0.8
+  num_cores: 1
+  force_diff_atlas: true
+  template_path: "/path/to/Schaefer2018_400Parcels_7Networks_order_Tian_Subcortex_S4_3T_MNI152NLin2009cAsym_2mm.nii.gz"
 
-# --------------------------------------------------------------------------
-# ANALYSIS BLOCKS
-# --------------------------------------------------------------------------
-# Each entry is one analysis to run. They execute in order (top to bottom).
-
+# ============================================================================
+# analyses
+# ============================================================================
 analyses:
 
-  # ========================================================================
-  # TASK ACTIVATION (type: task_act)
-  # ========================================================================
-  # Runs first-level regression with 3dDeconvolve, optionally extracts
-  # condition/contrast-specific maps and parcel-level statistics.
-  - name: "nback_activation"
+  # ------------------------------------------------------------------
+  # nback activation analysis (task_act)
+  # ------------------------------------------------------------------
+  - name: "nback_act"
     type: "task_act"
 
-    # -- Per-analysis censoring parameters --
-    fd_threshold: 0.9            # Framewise displacement threshold (mm) for censoring
-    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    # Censoring: Power FD threshold (50 mm), computed by fmri-first-level-proc
+    fd_threshold: 0.9
+    censor_prev_tr: false
 
-    # -- Per-participant input file paths --
+    # Model
+    hrf_model: "GAM"
+    custom_hrf: null
+    include_motion_derivs: false
+    use_tissue_derivs: false
+
+    # Output control
+    average_type: "mean"
+    scale_to_psc: true
+    smoothing:
+      enabled: false
+    remove_previous: true
+    roi_zero_handling: "exclude"
+
+    # Per-run paths (orchestrator-filled placeholders)
+    run_labels: [1]
+    out_dir: "/__ORCHESTRATOR_FILLED__"
+    out_file_pre: "__ORCHESTRATOR_FILLED__"
     paths:
-      scan_path: "/path/to/subj001_nback_concat.nii.gz"
-      task_timing_path: "/path/to/subj001_nback_timing.csv"
-      motion_path: "/path/to/subj001_nback_motion.txt"
-      CSF_path: null             # mean CSF BOLD signal per TR, or null
-      WM_path: null              # mean WM BOLD signal per TR, or null
+      scan_paths: ["/__ORCHESTRATOR_FILLED__"]
+      task_timing_paths: ["/__ORCHESTRATOR_FILLED__"]
+      motion_paths: ["/__ORCHESTRATOR_FILLED__"]
+      CSF_paths: null
+      WM_paths: null
 
-    # -- Output settings --
-    out_dir: "/path/to/output/subj001/nback_act"
-    out_file_pre: "subj001_nback_baseline"
+    # Condition labels (0-back pre-block events pooled as target_0back;
+    # 2-back pre-block events labeled as instruction)
+    cond_labels:
+      - "0_back_negface"
+      - "0_back_posface"
+      - "0_back_neutface"
+      - "0_back_place"
+      - "2_back_negface"
+      - "2_back_posface"
+      - "2_back_neutface"
+      - "2_back_place"
+      - "target_0back"
+      - "instruction"
 
-    # -- Condition labels (must match CONDITION column in timing CSV) --
-    cond_labels: ["stimFear", "stimSad", "stimNeu"]
-
-    # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
-    average_type: "mean"         # "mean" or "median" for parcel averaging
-    hrf_model: "GAM"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
-    custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
-    include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
-    use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
-
-    # -- Contrasts --
-    # functions: null = disabled; list of equations = enabled
+    # 29 contrasts (address by label, never by sub-brick index)
     contrasts:
-      functions:
-        - "1*stimFear-1*stimNeu"
-        - "1*stimSad-1*stimNeu"
       labels:
-        - "Fear-Neutral"
-        - "Sad-Neutral"
+        - "ave_negface"
+        - "ave_posface"
+        - "ave_neutface"
+        - "ave_place"
+        - "ave_zback"
+        - "ave_tback"
+        - "ave_negface-ave_posface"
+        - "ave_negface-ave_neutface"
+        - "ave_negface-ave_place"
+        - "ave_posface-ave_neutface"
+        - "ave_posface-ave_place"
+        - "ave_neutface-ave_place"
+        - "ave_tback-ave_zback"
+        - "negface_tback-zback"
+        - "posface_tback-zback"
+        - "neutface_tback-zback"
+        - "place_tback-zback"
+        - "zback_negface-posface"
+        - "zback_negface-neutface"
+        - "zback_negface-place"
+        - "zback_posface-neutface"
+        - "zback_posface-place"
+        - "zback_neutface-place"
+        - "tback_negface-posface"
+        - "tback_negface-neutface"
+        - "tback_negface-place"
+        - "tback_posface-neutface"
+        - "tback_posface-place"
+        - "tback_neutface-place"
+      functions:
+        - "0.5*0_back_negface+0.5*2_back_negface"
+        - "0.5*0_back_posface+0.5*2_back_posface"
+        - "0.5*0_back_neutface+0.5*2_back_neutface"
+        - "0.5*0_back_place+0.5*2_back_place"
+        - "0.25*0_back_negface+0.25*0_back_posface+0.25*0_back_neutface+0.25*0_back_place"
+        - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_posface-0.5*2_back_posface"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_neutface-0.5*2_back_neutface"
+        - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_place-0.5*2_back_place"
+        - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_neutface-0.5*2_back_neutface"
+        - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_place-0.5*2_back_place"
+        - "0.5*0_back_neutface+0.5*2_back_neutface-0.5*0_back_place-0.5*2_back_place"
+        - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place-0.25*0_back_negface-0.25*0_back_posface-0.25*0_back_neutface-0.25*0_back_place"
+        - "1*2_back_negface-1*0_back_negface"
+        - "1*2_back_posface-1*0_back_posface"
+        - "1*2_back_neutface-1*0_back_neutface"
+        - "1*2_back_place-1*0_back_place"
+        - "1*0_back_negface-1*0_back_posface"
+        - "1*0_back_negface-1*0_back_neutface"
+        - "1*0_back_negface-1*0_back_place"
+        - "1*0_back_posface-1*0_back_neutface"
+        - "1*0_back_posface-1*0_back_place"
+        - "1*0_back_neutface-1*0_back_place"
+        - "1*2_back_negface-1*2_back_posface"
+        - "1*2_back_negface-1*2_back_neutface"
+        - "1*2_back_negface-1*2_back_place"
+        - "1*2_back_posface-1*2_back_neutface"
+        - "1*2_back_posface-1*2_back_place"
+        - "1*2_back_neutface-1*2_back_place"
 
-    # -- Extraction --
+    # Extraction
     extraction:
-      extract: true              # true = enable extraction, false = skip
-      extract_labels: ["stimFear", "stimSad", "Fear-Neutral", "Sad-Neutral"]
-      extract_stat: "z"          # "z" | "t" | "r"
-      extract_out_file_pre: "subj001_nback_baseline_Shen368"
-      extract_resids: false      # true = extract residuals as well as stats
-      extract_raw_ptseries: true  # true = extract pre-regression parcellated time series (requires template_path and extract_out_file_pre)
+      stat_buckets: ["Coef", "Tstat", "Zstat"]
+      extract_out_file_pre: "__ORCHESTRATOR_FILLED__"
+      extract_resids: true
+      extract_raw_ptseries: true
 
-  # ========================================================================
-  # TASK CONNECTIVITY (type: task_conn)
-  # ========================================================================
-  # Generates beta series via 3dLSS, optionally extracts parcel-level beta
-  # series, and optionally computes functional connectivity.
-  - name: "nback_connectivity"
+  # ------------------------------------------------------------------
+  # nback connectivity analysis (task_conn)
+  # ------------------------------------------------------------------
+  - name: "nback_conn"
     type: "task_conn"
 
-    # -- Per-analysis censoring parameters --
-    fd_threshold: 0.9            # Framewise displacement threshold (mm) for censoring
-    censor_prev_tr: false        # true = also censor the TR before a high-motion TR
+    fd_threshold: 0.9
+    censor_prev_tr: false
 
+    hrf_model: "GAM"
+    custom_hrf: null
+    include_motion_derivs: false
+    use_tissue_derivs: false
+
+    average_type: "mean"
+    scale_to_psc: true
+    smoothing:
+      enabled: false
+    remove_previous: true
+    roi_zero_handling: "exclude"
+
+    run_labels: [1]
+    out_dir: "/__ORCHESTRATOR_FILLED__"
+    out_file_pre: "__ORCHESTRATOR_FILLED__"
     paths:
-      scan_path: "/path/to/subj001_nback_concat.nii.gz"
-      task_timing_path: "/path/to/subj001_nback_timing.csv"
-      motion_path: "/path/to/subj001_nback_motion.txt"
-      CSF_path: null            # mean CSF BOLD signal per TR, or null
-      WM_path: null             # mean WM BOLD signal per TR, or null
+      scan_paths: ["/__ORCHESTRATOR_FILLED__"]
+      task_timing_paths: ["/__ORCHESTRATOR_FILLED__"]
+      motion_paths: ["/__ORCHESTRATOR_FILLED__"]
+      CSF_paths: null
+      WM_paths: null
 
-    out_dir: "/path/to/output/subj001/nback_conn"
-    out_file_pre: "subj001_nback_baseline"
+    # Beta-series labels (target_0back and instruction are modeled upstream
+    # as non-beta nuisance regressors, never floor-dropped)
+    cond_beta_labels:
+      - "0_back_negface"
+      - "0_back_posface"
+      - "0_back_neutface"
+      - "0_back_place"
+      - "2_back_negface"
+      - "2_back_posface"
+      - "2_back_neutface"
+      - "2_back_place"
 
-    # -- Condition beta labels --
-    # Conditions for which trial-level beta series will be estimated.
-    cond_beta_labels: ["stimFear", "stimSad", "stimNeu"]
-
-    # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
-    average_type: "mean"         # "mean" or "median" for parcel averaging
-    hrf_model: "GAM"             # "GAM" | "BLOCK" | "dmBLOCK" | "SPMG1" | "custom"
-    custom_hrf: null             # Required when hrf_model is "custom", e.g. "TENT(0,14,8)"
-    include_motion_derivs: false # true = use first 12 columns (base + derivs); false = use first 6 columns only
-    use_tissue_derivs: false     # true = include first temporal derivatives of tissue signals (CSF/WM) as additional regressors
-
-    # -- Extraction --
     extraction:
-      extract_pbseries: true     # true = extract parcel beta series, false = skip
-      extract_out_file_pre: "subj001_nback_baseline_Shen368"
-      extract_raw_ptseries: true  # true = extract pre-regression parcellated time series (requires template_path and extract_out_file_pre)
+      extract_pbseries: true
+      extract_out_file_pre: "__ORCHESTRATOR_FILLED__"
+      extract_raw_ptseries: true
 
-    # -- Connectivity --
     connectivity:
-      calc_conn: "parcellated"   # null = disabled; "seed_to_voxel" | "parcellated" = enabled
-      conn_out_file_pre: "subj001_nback_baseline_Shen368"
-      pcorr: false               # use partial correlation
-      fishZ: true                # use Fisher Z transform on correlation coefficients
-      # -- Connectivity Contrasts --
-      # Linear combinations of condition-level connectivity outputs.
-      # Requires calc_conn != null. Conditions must reference entries in cond_beta_labels.
-      # functions: null = disabled; list of equations = enabled
+      calc_conn: "parcellated"
+      conn_out_file_pre: "__ORCHESTRATOR_FILLED__"
+      pcorr: false
+      fishZ: true
+      # Same 29 contrasts as nback_act (identical label/function order)
       contrasts:
-        functions:
-          - "1*stimFear-1*stimNeu"
-          - "1*stimSad-1*stimNeu"
         labels:
-          - "Fear-Neutral"
-          - "Sad-Neutral"
+          - "ave_negface"
+          - "ave_posface"
+          - "ave_neutface"
+          - "ave_place"
+          - "ave_zback"
+          - "ave_tback"
+          - "ave_negface-ave_posface"
+          - "ave_negface-ave_neutface"
+          - "ave_negface-ave_place"
+          - "ave_posface-ave_neutface"
+          - "ave_posface-ave_place"
+          - "ave_neutface-ave_place"
+          - "ave_tback-ave_zback"
+          - "negface_tback-zback"
+          - "posface_tback-zback"
+          - "neutface_tback-zback"
+          - "place_tback-zback"
+          - "zback_negface-posface"
+          - "zback_negface-neutface"
+          - "zback_negface-place"
+          - "zback_posface-neutface"
+          - "zback_posface-place"
+          - "zback_neutface-place"
+          - "tback_negface-posface"
+          - "tback_negface-neutface"
+          - "tback_negface-place"
+          - "tback_posface-neutface"
+          - "tback_posface-place"
+          - "tback_neutface-place"
+        functions:
+          - "0.5*0_back_negface+0.5*2_back_negface"
+          - "0.5*0_back_posface+0.5*2_back_posface"
+          - "0.5*0_back_neutface+0.5*2_back_neutface"
+          - "0.5*0_back_place+0.5*2_back_place"
+          - "0.25*0_back_negface+0.25*0_back_posface+0.25*0_back_neutface+0.25*0_back_place"
+          - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_posface-0.5*2_back_posface"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_neutface-0.5*2_back_neutface"
+          - "0.5*0_back_negface+0.5*2_back_negface-0.5*0_back_place-0.5*2_back_place"
+          - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_neutface-0.5*2_back_neutface"
+          - "0.5*0_back_posface+0.5*2_back_posface-0.5*0_back_place-0.5*2_back_place"
+          - "0.5*0_back_neutface+0.5*2_back_neutface-0.5*0_back_place-0.5*2_back_place"
+          - "0.25*2_back_negface+0.25*2_back_posface+0.25*2_back_neutface+0.25*2_back_place-0.25*0_back_negface-0.25*0_back_posface-0.25*0_back_neutface-0.25*0_back_place"
+          - "1*2_back_negface-1*0_back_negface"
+          - "1*2_back_posface-1*0_back_posface"
+          - "1*2_back_neutface-1*0_back_neutface"
+          - "1*2_back_place-1*0_back_place"
+          - "1*0_back_negface-1*0_back_posface"
+          - "1*0_back_negface-1*0_back_neutface"
+          - "1*0_back_negface-1*0_back_place"
+          - "1*0_back_posface-1*0_back_neutface"
+          - "1*0_back_posface-1*0_back_place"
+          - "1*0_back_neutface-1*0_back_place"
+          - "1*2_back_negface-1*2_back_posface"
+          - "1*2_back_negface-1*2_back_neutface"
+          - "1*2_back_negface-1*2_back_place"
+          - "1*2_back_posface-1*2_back_neutface"
+          - "1*2_back_posface-1*2_back_place"
+          - "1*2_back_neutface-1*2_back_place"
 
-  # ========================================================================
-  # RESTING-STATE CONNECTIVITY (type: rest_conn)
-  # ========================================================================
-  # Generates residual time series via 3dTproject, optionally extracts
-  # parcel-level time series, and optionally computes functional connectivity.
-  # NOTE: rest_conn uses lists for paths (one entry per run).
-  - name: "rest_connectivity"
+  # ------------------------------------------------------------------
+  # Resting-state connectivity analysis (rest_conn)
+  # ------------------------------------------------------------------
+  - name: "rest_conn"
     type: "rest_conn"
 
-    # -- Per-analysis censoring parameters --
-    fd_threshold: 0.4            # Framewise displacement threshold (mm) for censoring
-    censor_prev_tr: true        # true = also censor the TR before a high-motion TR
+    fd_threshold: 0.4
+    censor_prev_tr: true
 
-    # -- Per-run input file paths (all lists must be the same length) --
+    average_type: "mean"
+    scale_to_psc: true
+    smoothing:
+      enabled: false
+    remove_previous: true
+    roi_zero_handling: "exclude"
+
+    run_labels: [1]
+    out_dir: "/__ORCHESTRATOR_FILLED__"
+    out_file_pre: "__ORCHESTRATOR_FILLED__"
     paths:
-      scan_paths:
-        - "/path/to/subj001_rest_run1.nii.gz"
-        - "/path/to/subj001_rest_run2.nii.gz"
-      motion_paths:
-        - "/path/to/subj001_rest_run1_motion.txt"
-        - "/path/to/subj001_rest_run2_motion.txt"
-      CSF_paths:
-        - "/path/to/subj001_rest_run1_CSF.txt"
-        - "/path/to/subj001_rest_run2_CSF.txt"
-      WM_paths:
-        - "/path/to/subj001_rest_run1_WM.txt"
-        - "/path/to/subj001_rest_run2_WM.txt"
-      GS_paths: null             # null = no global signal regression; list of paths = enable GSR
+      scan_paths: ["/__ORCHESTRATOR_FILLED__"]
+      motion_paths: ["/__ORCHESTRATOR_FILLED__"]
+      CSF_paths: ["/__ORCHESTRATOR_FILLED__"]
+      WM_paths: ["/__ORCHESTRATOR_FILLED__"]
+      GS_paths: null    # No global signal regression
 
-    out_dir: "/path/to/output/subj001/rest_conn"
-    out_file_pre: "subj001_rest_baseline"
+    # Nuisance model
+    bandpass: [0.01, 0.1]
+    notch_filter_band: [0.31, 0.43]
+    motion_deriv_degree: 2
+    use_tissue_derivs: true
+    keep_run_res_dtseries: true
+    use_sequenced_bandpass: false
 
-    # -- Block settings --
-    remove_previous: false       # true = delete all files in out_dir before running
-    average_type: "mean"         # "mean" or "median" for parcel averaging
-    bandpass: [0.01, 0.1]        # Required: [low, high] Hz
-    notch_filter_band: [0.31, 0.43]  # Respiration notch filter Hz band applied to motion before FD censoring (null = disabled)
-    motion_deriv_degree: 2       # Required: number of derivative orders (total motion cols = 6 * degree); e.g. 2 = base + 1st derivs = 12 cols
-    keep_run_res_dtseries: true  # true = keep all run-specific dtseries (false to save space)
-    use_sequenced_bandpass: false # true = use Ciric-inspired sequenced denoising (NTRP interpolation + decoupled BOLD/nuisance bandpass) for DOF-constrained cohorts; false = simultaneous denoising (default)
-    use_tissue_derivs: true     # true = include first temporal derivatives of tissue signals (CSF/WM/GS) as additional regressors
-
-    # -- Extraction --
     extraction:
-      extract_ptseries: true     # true = extract parcel time series, false = skip
-      extract_out_file_pre: "subj001_rest_baseline_Shen368"
-      extract_raw_ptseries: true  # true = extract pre-regression parcellated time series per run (requires template_path and extract_out_file_pre)
+      extract_ptseries: true
+      extract_out_file_pre: "__ORCHESTRATOR_FILLED__"
+      extract_raw_ptseries: true
 
-    # -- Connectivity --
     connectivity:
-      calc_conn: "parcellated"   # null = disabled; "seed_to_voxel" | "parcellated" = enabled
-      conn_out_file_pre: "subj001_rest_baseline_R_amyg"
-      pcorr: false               # use partial correlation
-      fishZ: true                # use Fisher Z transform on correlation coefficients
+      calc_conn: "parcellated"
+      conn_out_file_pre: "__ORCHESTRATOR_FILLED__"
+      pcorr: false
+      fishZ: true

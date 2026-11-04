@@ -6,9 +6,9 @@
   <scope_note>
     This report records a follow-up documentation edit applied at orchestrator level, after the
     primary /document pass at 17:12:36Z had completed. The follow-up was triggered by a
-    user-requested exhaustive LLM-attribution scrub scan. The scrub identified one borderline framing item in AID_LOG.md, surfaced it to the user as
-    a scope decision, and applied the user-approved rephrasing under a narrow, session-bound
-    filesystem grant.
+    user-requested exhaustive LLM-attribution scrub scan. The scrub identified one borderline
+    framing item in AID_LOG.md, surfaced it to the user as a scope decision, and applied the
+    user-approved rephrasing under a narrow, session-bound filesystem grant.
   </scope_note>
 
   <files_updated>

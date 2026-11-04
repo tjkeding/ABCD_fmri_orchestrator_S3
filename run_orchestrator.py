@@ -1,36 +1,8 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# PARALLEL BATCH RUNNER FOR fMRI FIRST-LEVEL ORCHESTRATOR
-#
-# Runs orchestrate_first_level.py in parallel across a list of subjects
-# using a thread pool (each thread launches a subprocess). Progress is
-# tracked with a rolling status line updated every 2 seconds. A summary
-# CSV is written after all subjects complete (or on Ctrl+C).
-#
-# Usage:
-#   python run_orchestrator.py \
-#     --orchestrate_config study.yaml \
-#     --proc_config example_config.yaml \
-#     --subject-list subjects.txt \
-#     --n-jobs 8 \
-#     --log-dir logs/ \
-#     [--dry-run] [--skip-qc] [--skip-first-level] \
-#     [--summary-file summary.csv]
-#
-# Subject list format:
-#   Plain text, one sub_id per line.
-#   Blank lines and lines starting with '#' are ignored.
-#   Duplicate IDs produce a warning and are skipped.
-#
-# Exit codes:
-#   0   — all subjects succeeded
-#   1   — one or more subjects failed
-#   130 — interrupted by Ctrl+C
-#
+# Parallel batch runner: orchestrate_first_level.py over a subject list in a thread pool
 # Author: Taylor J. Keding, Ph.D.
-# Version: 2.0
-# Last updated: 02/19/26
 # ============================================================================
 
 import os
@@ -43,9 +15,7 @@ import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------------------------------------------------------------------------
-# Module-level path resolution (validated before any worker is launched)
-# ---------------------------------------------------------------------------
+# Resolved at import; existence is checked before any worker launches
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ORCHESTRATE_SCRIPT = os.path.join(_THIS_DIR, "orchestrate_first_level.py")
 
@@ -56,10 +26,7 @@ _ORCHESTRATE_SCRIPT = os.path.join(_THIS_DIR, "orchestrate_first_level.py")
 
 def parse_subject_list(path):
     """
-    Parse a plain-text subject list file.
-
-    Blank lines and '#'-prefixed lines are ignored. Duplicate IDs produce a
-    warning and are skipped.
+    Read a subject list, ignoring blank and '#' lines and skipping duplicate IDs with a warning.
 
     Parameters
     ----------
@@ -84,7 +51,7 @@ def parse_subject_list(path):
             if s in seen:
                 print(
                     f"WARNING: Duplicate subject ID on line {lineno}: "
-                    f"'{s}' — skipping.",
+                    f"'{s}', skipping.",
                     flush=True
                 )
                 continue
@@ -101,9 +68,6 @@ def _run_one(sub_id, orchestrate_config_path, proc_config_path, log_dir, extra_f
     """
     Run orchestrate_first_level.py for one subject in a subprocess.
 
-    Checks cancel_event before starting so that pending workers can be
-    cleanly skipped on KeyboardInterrupt.
-
     Parameters
     ----------
     sub_id : str
@@ -111,24 +75,21 @@ def _run_one(sub_id, orchestrate_config_path, proc_config_path, log_dir, extra_f
     proc_config_path : str
     log_dir : str
     extra_flags : list of str
-        Extra CLI flags forwarded to orchestrate_first_level.py
-        (e.g. ["--dry-run", "--skip-qc"]).
+        CLI flags forwarded to orchestrate_first_level.py (e.g. ["--dry-run"]).
     state : dict
-        Shared progress state dict.
+        Shared progress state.
     lock : threading.Lock
     cancel_event : threading.Event
-        Set on KeyboardInterrupt; prevents not-yet-started workers from
-        launching their subprocess.
+        Set on Ctrl+C; workers that have not started return "cancelled".
 
     Returns
     -------
     tuple of (str, float, str, str)
-        (status, runtime_seconds, error_message, log_file)
-        status is one of "success", "failed", "cancelled".
+        (status: "success" | "failed_unexplained" | "failed_known_cause" | "cancelled",
+        runtime_seconds, error_message, log_file).
     """
     log_file = os.path.join(log_dir, f"{sub_id}.log")
 
-    # Bail out early if a cancel has been requested
     if cancel_event.is_set():
         return "cancelled", 0.0, "Cancelled before start", log_file
 
@@ -164,15 +125,20 @@ def _run_one(sub_id, orchestrate_config_path, proc_config_path, log_dir, extra_f
             else:
                 stdout_lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
                 err_msg = stdout_lines[-1] if stdout_lines else f"Exit code {result.returncode}"
+            if result.returncode == 2:
+                # Terminal known-cause failure; rerunning cannot change it
+                with lock:
+                    state["n_failed_known"] += 1
+                return "failed_known_cause", runtime, err_msg, log_file
             with lock:
-                state["n_failed"] += 1
-            return "failed", runtime, err_msg, log_file
+                state["n_failed_unexplained"] += 1
+            return "failed_unexplained", runtime, err_msg, log_file
 
     except Exception as e:
         runtime = time.time() - t0
         with lock:
-            state["n_failed"] += 1
-        return "failed", runtime, str(e), log_file
+            state["n_failed_unexplained"] += 1
+        return "failed_unexplained", runtime, str(e), log_file
 
     finally:
         with lock:
@@ -183,20 +149,15 @@ def _run_one(sub_id, orchestrate_config_path, proc_config_path, log_dir, extra_f
 # ============================================================================
 
 def _progress_loop(state, lock, total, stop_event):
-    """
-    Daemon thread that prints a rolling progress line every 2 seconds.
-
-    Prints a final newline when stop_event is set so the terminal is left
-    clean after the run.
-    """
+    """Print a rolling progress line every 2 s until stop_event is set, then a final newline."""
     while not stop_event.is_set():
         with lock:
             running = sorted(state["running"])
             ns = state["n_success"]
-            nf = state["n_failed"]
-            nsk = state["n_skipped"]
+            nfu = state["n_failed_unexplained"]
+            nfk = state["n_failed_known"]
 
-        n_done = ns + nf + nsk
+        n_done = ns + nfu + nfk
 
         if len(running) > 6:
             running_str = ", ".join(running[:6]) + f", …+{len(running) - 6}"
@@ -207,7 +168,7 @@ def _progress_loop(state, lock, total, stop_event):
 
         line = (
             f"\r[{n_done:3d}/{total}] Running: {running_str} | "
-            f"Done: {ns} success, {nf} failed, {nsk} skipped"
+            f"Done: {ns} ok, {nfu} failed, {nfk} known-cause"
         )
         sys.stdout.write(line[:120])
         sys.stdout.flush()
@@ -236,6 +197,7 @@ def _write_summary_csv(summary_rows, summary_file):
 # ============================================================================
 
 def main():
+    """Run every listed participant in a thread pool, write the summary CSV, and exit with the batch outcome code."""
     parser = argparse.ArgumentParser(
         description="Parallel batch runner for the fMRI first-level orchestrator.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -243,13 +205,26 @@ def main():
 Examples:
   # Dry run, 2 parallel workers
   python run_orchestrator.py --orchestrate_config study.yaml \\
-    --proc_config example_config.yaml \\
+    --proc_config example_proc_config.yaml \\
     --subject-list subjects.txt --n-jobs 2 --log-dir logs/ --dry-run
 
   # Full run, 8 parallel workers
   python run_orchestrator.py --orchestrate_config study.yaml \\
-    --proc_config example_config.yaml \\
+    --proc_config example_proc_config.yaml \\
     --subject-list subjects.txt --n-jobs 8 --log-dir logs/
+
+Subject list format:
+  Plain text, one sub_id per line.
+  Blank lines and lines starting with '#' are ignored.
+  Duplicate IDs produce a warning and are skipped.
+
+Exit codes:
+  0:   all subjects completed
+  1:   one or more subjects failed with an unexplained cause
+       (orchestrator exit 1, any other nonzero exit code, or a crash)
+  2:   one or more subjects failed with a known cause (orchestrator
+       exit 2) and none failed unexplained
+  130: interrupted by Ctrl+C
         """,
     )
     parser.add_argument(
@@ -301,9 +276,6 @@ Examples:
     )
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Pre-flight checks
-    # ------------------------------------------------------------------
     if not os.path.isfile(_ORCHESTRATE_SCRIPT):
         print(
             f"ERROR: orchestrate_first_level.py not found: {_ORCHESTRATE_SCRIPT}",
@@ -337,7 +309,6 @@ Examples:
     if args.dry_run:
         print("Mode      : DRY RUN", flush=True)
 
-    # Flags forwarded to each orchestrate_first_level.py call
     extra_flags = []
     if args.dry_run:
         extra_flags.append("--dry-run")
@@ -348,15 +319,12 @@ Examples:
     if args.session:
         extra_flags.extend(["--session", args.session])
 
-    # ------------------------------------------------------------------
-    # Shared state
-    # ------------------------------------------------------------------
-    state = {"running": set(), "n_success": 0, "n_failed": 0, "n_skipped": 0}
+    state = {"running": set(), "n_success": 0, "n_failed_unexplained": 0,
+             "n_failed_known": 0}
     lock = threading.Lock()
     cancel_event = threading.Event()
     stop_event = threading.Event()
 
-    # Background progress printer (daemon — auto-exits when main thread ends)
     progress_thread = threading.Thread(
         target=_progress_loop,
         args=(state, lock, total, stop_event),
@@ -364,9 +332,6 @@ Examples:
     )
     progress_thread.start()
 
-    # ------------------------------------------------------------------
-    # Parallel execution
-    # ------------------------------------------------------------------
     summary_rows = []
     futures_done = set()
     future_to_sub = {}
@@ -377,7 +342,6 @@ Examples:
         executor = ThreadPoolExecutor(max_workers=args.n_jobs)
 
         try:
-            # Submit all subjects
             for sub_id in sub_ids:
                 f = executor.submit(
                     _run_one,
@@ -387,19 +351,18 @@ Examples:
                 )
                 future_to_sub[f] = sub_id
 
-            # Collect results as they complete
             for future in as_completed(future_to_sub):
                 sub_id = future_to_sub[future]
                 futures_done.add(future)
                 try:
                     status, runtime, error_message, log_file = future.result()
                 except Exception as e:
-                    status = "failed"
+                    status = "failed_unexplained"
                     runtime = 0.0
                     error_message = str(e)
                     log_file = os.path.join(args.log_dir, f"{sub_id}.log")
                     with lock:
-                        state["n_failed"] += 1
+                        state["n_failed_unexplained"] += 1
 
                 summary_rows.append({
                     "sub_id": sub_id,
@@ -408,23 +371,22 @@ Examples:
                     "error_message": error_message,
                     "log_file": log_file,
                 })
-                if status == "failed":
+                if status == "failed_unexplained":
                     exit_code = 1
+                elif status == "failed_known_cause" and exit_code == 0:
+                    exit_code = 2
 
         except KeyboardInterrupt:
             interrupted = True
             print(
-                "\nInterrupted (Ctrl+C) — cancelling pending jobs, "
+                "\nInterrupted (Ctrl+C): cancelling pending jobs, "
                 "waiting for in-flight analyses to finish...",
                 flush=True
             )
             cancel_event.set()
-            # shutdown(wait=True) waits for threads currently running
-            # subprocesses to finish; cancel_event prevents new workers
-            # from launching their subprocess.
+            # In-flight subprocesses finish; cancel_event stops queued workers from launching
             executor.shutdown(wait=True)
 
-            # Collect results from futures that completed during the wait
             for f, sub_id in future_to_sub.items():
                 if f in futures_done:
                     continue
@@ -432,7 +394,7 @@ Examples:
                     try:
                         status, runtime, error_message, log_file = f.result()
                     except Exception as e:
-                        status = "failed"
+                        status = "failed_unexplained"
                         runtime = 0.0
                         error_message = str(e)
                         log_file = os.path.join(args.log_dir, f"{sub_id}.log")
@@ -444,7 +406,6 @@ Examples:
                         "log_file": log_file,
                     })
                 else:
-                    # Never started or was cancelled before starting
                     summary_rows.append({
                         "sub_id": sub_id,
                         "status": "cancelled",
@@ -460,17 +421,17 @@ Examples:
         stop_event.set()
         progress_thread.join(timeout=3.0)
 
-    # ------------------------------------------------------------------
-    # Write summary CSV (always, even on interrupt)
-    # ------------------------------------------------------------------
+    # Written even on interrupt
     _write_summary_csv(summary_rows, args.summary_file)
 
     n_success = sum(1 for r in summary_rows if r["status"] == "success")
-    n_failed = sum(1 for r in summary_rows if r["status"] == "failed")
+    n_failed_unexplained = sum(1 for r in summary_rows if r["status"] == "failed_unexplained")
+    n_failed_known = sum(1 for r in summary_rows if r["status"] == "failed_known_cause")
     n_cancelled = sum(1 for r in summary_rows if r["status"] == "cancelled")
 
     print(
-        f"\nBatch complete: {n_success} success, {n_failed} failed, "
+        f"\nBatch complete: {n_success} success, {n_failed_unexplained} failed "
+        f"(unexplained), {n_failed_known} failed (known cause), "
         f"{n_cancelled} cancelled",
         flush=True
     )

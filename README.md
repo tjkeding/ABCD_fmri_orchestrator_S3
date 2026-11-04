@@ -1,488 +1,281 @@
 # ABCD_fmri_orchestrator_S3
 
-A session-centric orchestrator for first-level fMRI processing on AWS EC2/S3, purpose-built for the Adolescent Brain and Cognitive Development (ABCD) study (~11,000 subjects, up to 4 timepoints, 2 functional imaging modalities). It wraps [fmri_first_level_proc](https://github.com/tjkeding/fmri_first_level_proc) and handles the full lifecycle of downloading fMRIPrep derivatives from S3, preprocessing, running first-level analyses, and uploading results — one session at a time to minimize disk usage on EC2 instances.
+A session-centric orchestrator for first-level fMRI analysis of the Adolescent Brain Cognitive Development (ABCD) Study on AWS. For each participant it discovers the functional preprocessing outputs stored per file on S3, prepares per-run inputs (non-steady-state trimming, motion and tissue regressors, task timing), runs first-level analyses with [fmri-first-level-proc](https://github.com/tjkeding/fmri-first-level-proc), and uploads the results per file with a completion sentinel. Sessions are processed one at a time, so local disk use is bounded by a single session.
+
+The orchestrator is specific to the ABCD emotional n-back task (`nback`) and resting-state (`rest`) scans. All analysis settings live in the fmri-first-level-proc template config; the orchestrator fills in only participant-, session- and run-specific fields.
 
 Two entry points are provided:
-- **`orchestrate_first_level.py`** — processes a single subject (all available sessions)
-- **`run_orchestrator.py`** — parallel batch runner for processing many subjects concurrently
 
-## Architecture
+- `orchestrate_first_level.py` processes one participant (all available sessions, or one session with `--session`).
+- `run_orchestrator.py` runs `orchestrate_first_level.py` over a list of participants in parallel.
 
-```
-run_orchestrator.py
-│
-│  Reads subject list, launches ThreadPoolExecutor
-│  Each thread runs orchestrate_first_level.py as a subprocess
-│
-└──► orchestrate_first_level.py  [per subject]
-     │
-     │  Step 0: Discover available sessions (S3 HEAD requests)
-     │
-     └──► _process_session()  [per session]
-          │
-          ├── Step 1:  Download session data from S3 (archive + events + motion)
-          ├── Step 2:  Extract fMRIPrep archive
-          ├── Step 3:  Discover files per task (glob func/ + match motion files)
-          │
-          │   ┌── Per task, per run ──────────────────────────────┐
-          ├── │ Step 4:  Decompress if needed (.bz2/.gz/.tar.gz) │
-          │   │ Step 5:  Apply brain mask (3dcalc)               │
-          │   │ Step 6:  Preprocessing QC (FD from raw motion)    │
-          │   │ Step 7:  Detect & remove non-steady-state TRs    │
-          │   │ Step 8:  Extract motion regressors (from raw TSV) │
-          │   │ Step 9:  Extract tissue signals (rest only)       │
-          │   │ Step 10: Format task timing (task only)           │
-          │   └──────────────────────────────────────────────────┘
-          │
-          ├── Step 11: Concatenate runs (task) or collect per-run (rest)
-          │             + optional spatial smoothing
-          ├── Step 12: Build first-level config & run analyses
-          └── Step 13: Upload outputs (per-file) to S3 → write _COMPLETE sentinel → cleanup
-```
+Every configuration field, input format, validation rule and output schema is specified in [INPUT_SPECIFICATION.md](INPUT_SPECIFICATION.md).
 
-## Prerequisites and Installation
+## Pipeline overview
 
-### Software Requirements
+For each participant, `orchestrate_first_level.py`:
 
-- **Python** >= 3.8
-- **AFNI** — must be installed and on `PATH` ([installation guide](https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html))
-- **AWS credentials** — configured via environment variables, `~/.aws/credentials`, or EC2 instance role
-- **conda** or **pip** (conda recommended)
+1. Verifies that the installed fmri-first-level-proc is >= 4.0.0 and < 5.0.0, checks the AFNI installation, and validates the two config files against each other.
+2. Lists the participant's input files on S3 once and builds the session, task and run inventory from the filenames. A session is used only when the producer's completion manifest (`_complete.json`) is present and every file it lists is present.
+3. Checks, before anything is downloaded, that every run has a brain mask and a confounds file and that each session has the CSF and WM masks required by the proc config.
 
-### Installation
+Then, for each session:
+
+4. Skips the session when its `_COMPLETE` sentinel already exists (unless `study.force_recompute` is true); otherwise downloads the session's inputs.
+5. Prepares each run: detects and trims non-steady-state volumes, computes preprocessing QC, writes the motion regressors after checking the rotation units against the producer's framewise displacement, computes CSF and WM regressors from the session tissue masks, and converts the n-back events to run-local timing. A run that cannot be prepared is excluded with a recorded reason, and the session continues with the remaining runs.
+6. Skips any analysis that has no usable runs or, for task analyses, whose required conditions are absent from every surviving run.
+7. Builds the session's first-level config from the proc template and runs each analysis with fmri-first-level-proc. A failed analysis does not stop the others.
+8. Writes a consolidated session QC JSON and classifies the session outcome as complete, failed with a known cause, or failed with an unexplained cause.
+9. Uploads the outputs per file, verifies them, removes stale keys left by earlier attempts, writes the `_COMPLETE` sentinel unless the failure is unexplained, and deletes the local files.
+
+The participant's exit code is the most severe session outcome.
+
+## Requirements
+
+- The conda environment in `environment.yaml` (Python 3.14 with numpy, pandas, PyYAML, matplotlib, boto3 and packaging). It installs fmri-first-level-proc from GitHub.
+- fmri-first-level-proc >= 4.0.0 and < 5.0.0. The version window is checked at startup.
+- [AFNI](https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html) on `PATH`, at or above the minimum version recorded in fmri-first-level-proc's tool lock file. AFNI is checked at startup (except under `--dry-run`).
+- AWS credentials (environment variables, a credentials file or an instance role) with read access to the input prefix and read, write and delete access to the upload prefix.
+
+## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/tjkeding/ABCD_fmri_orchestrator_S3.git
 cd ABCD_fmri_orchestrator_S3
-
-# Create and activate the conda environment
 conda env create -f environment.yaml
 conda activate ABCD_fmri_orchestrator_S3
-
-# Verify AFNI is available
-3dinfo -ver
+3dinfo -ver    # AFNI must be on PATH
 ```
 
-The conda environment installs `fmri_first_level_proc` directly from GitHub via pip. **Requires `fmri_first_level_proc` >= 2.5.0.** See `environment.yaml` for the full dependency list.
+## Quick start
 
-## Quick Start
-
-### Single Subject
+The example configs contain placeholder paths and a placeholder bucket name. Copy them and set `study.input_dir`, `study.output_dir` and `s3.bucket` (orchestrator config) and `global.template_path` (proc config) before use.
 
 ```bash
-# Full run
+# Validate both configs, run discovery and print the processing plan
+# (no downloads, no processing; S3 is still listed, so credentials are needed)
 python orchestrate_first_level.py \
-  --orchestrate_config study.yaml \
-  --proc_config example_config.yaml \
-  --subj_id NDARABC123 \
-  --log-file logs/NDARABC123.log
+  --orchestrate_config example_orchestrator_config.yaml \
+  --proc_config example_proc_config.yaml \
+  --subj_id SUBJ01 --dry-run
 
-# Dry run — validate config and print processing plan
+# Process one participant
 python orchestrate_first_level.py \
-  --orchestrate_config study.yaml \
-  --proc_config example_config.yaml \
-  --subj_id NDARABC123 \
-  --dry-run
+  --orchestrate_config example_orchestrator_config.yaml \
+  --proc_config example_proc_config.yaml \
+  --subj_id SUBJ01 --log-file logs/SUBJ01.log
+
+# Process a subject list, 8 participants at a time
+python run_orchestrator.py \
+  --orchestrate_config example_orchestrator_config.yaml \
+  --proc_config example_proc_config.yaml \
+  --subject-list subjects.txt --n-jobs 8 --log-dir logs/
 ```
 
-### Batch Processing
-
-```bash
-# Full run, 8 parallel workers
-python run_orchestrator.py \
-  --orchestrate_config study.yaml \
-  --proc_config example_config.yaml \
-  --subject-list subjects.txt \
-  --n-jobs 8 \
-  --log-dir logs/
-
-# Dry run
-python run_orchestrator.py \
-  --orchestrate_config study.yaml \
-  --proc_config example_config.yaml \
-  --subject-list subjects.txt \
-  --n-jobs 2 \
-  --log-dir logs/ \
-  --dry-run
-```
-
-## CLI Reference
+## Command-line reference
 
 ### `orchestrate_first_level.py`
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--orchestrate_config` | Yes | — | Path to the orchestrator YAML config file |
-| `--proc_config` | Yes | — | Path to the fmri_first_level_proc YAML template config |
-| `--subj_id` | Yes | — | Participant ID (e.g. `NDARABC123`) |
-| `--session` | No | `None` | Process only this session code (e.g. `00`). Useful for reprocessing a failed session. |
-| `--dry-run` | No | `False` | Validate config and print plan without executing |
-| `--log-file` | No | `None` | Path to a log file (logs to stdout if not set) |
-| `--skip-qc` | No | `False` | Skip all QC computations |
-| `--skip-first-level` | No | `False` | Run preprocessing only, skip first-level analyses |
+| `--orchestrate_config` | Yes | | Orchestrator YAML config |
+| `--proc_config` | Yes | | fmri-first-level-proc YAML template config |
+| `--subj_id` | Yes | | Participant ID, used verbatim in filenames and S3 keys (e.g. `SUBJ01`) |
+| `--session` | No | all sessions | Process only this session code (e.g. `00`) |
+| `--dry-run` | No | off | Validate configs, run discovery and the input-completeness check, and log the plan; no downloads, processing or uploads |
+| `--log-file` | No | none | Also write the log to this file |
+| `--skip-qc` | No | off | Skip preprocessing QC, first-level QC and the session QC JSON |
+| `--skip-first-level` | No | off | Prepare runs only; no analyses are run and no sentinel is written |
 
 ### `run_orchestrator.py`
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--orchestrate_config` | Yes | — | Path to the orchestrator YAML config file |
-| `--proc_config` | Yes | — | Path to the fmri_first_level_proc YAML template config |
-| `--subject-list` | Yes | — | Path to plain-text subject list file |
-| `--n-jobs` | No | `1` | Number of subjects to process in parallel |
-| `--log-dir` | Yes | — | Directory for per-subject log files |
-| `--dry-run` | No | `False` | Pass `--dry-run` to each subprocess |
-| `--skip-qc` | No | `False` | Pass `--skip-qc` to each subprocess |
-| `--skip-first-level` | No | `False` | Pass `--skip-first-level` to each subprocess |
-| `--session` | No | `None` | Pass `--session` to each subprocess |
-| `--summary-file` | No | `{log_dir}/run_summary_{timestamp}.csv` | Path to output summary CSV |
+| `--orchestrate_config` | Yes | | Passed to every participant run |
+| `--proc_config` | Yes | | Passed to every participant run |
+| `--subject-list` | Yes | | Plain-text subject list |
+| `--log-dir` | Yes | | Directory for per-participant logs (`{log_dir}/{sub_id}.log`) |
+| `--n-jobs` | No | `1` | Participants processed in parallel |
+| `--dry-run`, `--skip-qc`, `--skip-first-level`, `--session` | No | | Forwarded to every participant run |
+| `--summary-file` | No | `{log_dir}/run_summary_{YYYYMMDD_HHMMSS}.csv` | Batch summary CSV |
 
-### Exit Codes (Batch Runner)
-
-| Code | Meaning |
-|------|---------|
-| `0` | All subjects succeeded |
-| `1` | One or more subjects failed |
-| `130` | Interrupted by Ctrl+C |
-
-### Subject List Format
-
-Plain text, one subject ID per line. Blank lines and lines starting with `#` are ignored. Duplicate IDs produce a warning and are skipped.
+The subject list holds one participant ID per line. Blank lines and lines starting with `#` are ignored, and duplicate IDs are skipped with a warning.
 
 ```
-# ABCD subjects — wave 1
-NDARABC12345
-NDARDEF67890
-
-# Wave 2
-NDARGHI11111
+# example subject list
+SUBJ01
+SUBJ02
+SUBJ03
 ```
 
-## Pipeline Steps Explained
+### Exit codes
 
-### Step 0: Discover Available Sessions
+| Code | `orchestrate_first_level.py` | `run_orchestrator.py` |
+|------|------------------------------|-----------------------|
+| `0` | Every session complete | Every participant exited 0 |
+| `1` | At least one session failed with an unexplained cause, or a fatal error stopped the participant (invalid config, version or AFNI check, no sessions discovered, input-completeness failure) | At least one participant exited 1, exited with any other nonzero code, or crashed |
+| `2` | At least one session failed with a known cause (an analysis raised a `ModelError`, such as insufficient degrees of freedom) and none failed unexplained | At least one participant exited 2 and none exited 1 |
+| `130` | | Interrupted with Ctrl+C (in-flight participants finish, pending ones are cancelled, the summary CSV is still written) |
 
-When S3 is enabled, the orchestrator probes S3 for each session code in `s3.available_sessions` using HEAD requests against the expected archive key. Only sessions where an archive exists are processed. When S3 is disabled (local mode), the `available_sessions` list is used directly. The `--session` flag can further filter to a single session.
+## Configuration
 
-### Step 1: Download Session Data from S3
+Two YAML files configure a run.
 
-Downloads three types of files: (1) the fMRIPrep archive (`.tar.gz` containing BOLD, confounds, masks, and anatomical files), (2) task events files from the `mmps_mproc` prefix (non-rest tasks only), and (3) raw motion parameter files from `mmps_mproc` (ALL tasks including rest). Events and motion files are probed for runs 1–9 per task; download stops at the first missing run number. Already-present local files are skipped (idempotent).
+**Orchestrator config** (`--orchestrate_config`, see `example_orchestrator_config.yaml`):
 
-### Step 2: Extract fMRIPrep Archive
+| Section | Contents |
+|---------|----------|
+| `study` | `input_dir` and `output_dir` (absolute paths), `space` (template space entity of the input files), `TR` (seconds), `force_recompute` |
+| `tasks` | One entry per task label (`nback`, `rest`): events condition column, conditions to exclude, n-back cue relabeling |
+| `qc` | Switches for preprocessing QC (tSNR, carpet plots) and first-level QC |
+| `analyses` | One entry per analysis: `name` and `type` matching a proc-config block, `task_label`, and the filename prefixes appended to `sub-{ID}_ses-{NN}A_` |
+| `s3` | `enabled` (must be `true`), `bucket`, input prefix templates with `{subject}` and `{session}`, `upload_prefix`, `cleanup_after_upload`, `upload_max_workers` |
 
-Extracts the `.tar.gz` archive with safety checks: disk space verification (requires 10x archive size free) and path traversal protection (rejects tar members that resolve outside the target directory). The extractor searches for the `func/` subdirectory, which may be nested inside `sub-{ID}/ses-{session}A/` within the archive.
+**Proc config** (`--proc_config`, see `example_proc_config.yaml`): the fmri-first-level-proc analysis template. HRF model, contrasts, censoring thresholds, bandpass, nuisance model, extraction and connectivity settings are used exactly as written. The orchestrator fills in only each analysis's `out_dir`, output prefixes, per-run path lists and `run_labels`, and drops template blocks that the orchestrator config does not reference. See the fmri-first-level-proc repository for the full template schema.
 
-### Step 3: Discover Files Per Task
+The example configs define three analyses:
 
-Globs the extracted `func/` directory for BOLD files matching each task label and template space. For each discovered run, the corresponding confounds TSV, brain mask, raw motion file, and events file (matched by run number, not position) must all exist for the run to be included. Missing files produce warnings and the run is skipped. An anatomical brain mask is also discovered for optional registration QC.
+| Analysis | Type | Task | Key settings |
+|----------|------|------|--------------|
+| `nback_act` | `task_act` | `nback` | GAM HRF, 10 condition regressors (8 stimulus-by-load conditions, `target_0back`, `instruction`), 29 contrasts, FD censoring at 0.9 mm, percent signal change scaling |
+| `nback_conn` | `task_conn` | `nback` | Beta series for the 8 stimulus-by-load conditions, parcellated connectivity with Fisher z, the same 29 contrasts, FD censoring at 0.9 mm |
+| `rest_conn` | `rest_conn` | `rest` | CSF and WM regressors with derivatives, no global signal regression, 0.01 to 0.1 Hz bandpass, 0.31 to 0.43 Hz notch filter before censoring, FD censoring at 0.4 mm including the preceding volume, parcellated connectivity with Fisher z |
 
-### Step 4: Decompress If Needed
+All three use the Schaefer 400-parcel, 7-network cortical atlas combined with the Tian S4 subcortical atlas in MNI152NLin2009cAsym space at 2 mm (Schaefer et al., 2018; Tian et al., 2020).
 
-Handles files that may exist in compressed form (`.bz2`, `.gz`, or inside a `.tar.gz`). Most fMRIPrep outputs are `.nii.gz` and pass through unchanged. This step ensures confounds TSVs and other files are available in their expected format.
+## Inputs
 
-### Step 5: Apply Brain Mask
-
-Uses AFNI `3dcalc` with expression `a*step(b)` to zero out non-brain voxels. Produces `{prefix}_masked.nii.gz`. Idempotent — skips if output already exists.
-
-### Step 6: Preprocessing QC
-
-Computes per-run, non-motion quality metrics. DVARS (from fMRIPrep confounds), brain mask coverage (voxel count and volume in mm^3), and optionally tSNR (median within-brain temporal signal-to-noise ratio), carpet plots (DVARS trace above voxel-by-time heatmap), and registration quality (Dice coefficient between functional and anatomical brain masks) are computed. Motion metrics (FD, censor counts) are not computed here; they are sourced from upstream `enorm.1D`/`censor.1D` files produced by `fmri_first_level_proc` and reported in the per-analysis section of the consolidated session QC JSON. Skipped if `--skip-qc` is set or `qc.preproc.enabled` is false.
-
-### Step 7: Detect and Remove Non-Steady-State TRs
-
-Counts `non_steady_state_outlier_*` columns in the fMRIPrep confounds file to determine how many initial TRs to remove. Uses AFNI `3dTcat` to trim the BOLD timeseries. If no non-steady-state TRs are detected, the file passes through unchanged.
-
-### Step 8: Extract Motion Regressors
-
-Extracts the 6 base motion parameters (trans_x/y/z, rot_x/y/z) from the raw motion.tsv file (not fMRIPrep confounds). Rotations remain in degrees per the `fmri_first_level_proc` >= 2.5.0 input contract; no unit conversion is applied. Temporal derivatives are always computed numerically via finite differences (padded with 0.0 at the first row). Total output columns = `6 * (1 + calc_n_motion_derivs)`. NaN values indicate motion tracking failures and are imputed to 999.0, guaranteeing those TRs exceed any reasonable FD threshold and are censored by upstream `1d_tool.py`.
-
-### Step 9: Extract Tissue Signals (Rest Only)
-
-For resting-state tasks, extracts CSF, white matter, and global signal timeseries from the confounds TSV for use as nuisance regressors in rest_conn analyses.
-
-### Step 10: Format Task Timing (Task Only)
-
-Converts BIDS events TSVs to the first-level timing CSV format (CONDITION, ONSET, DURATION). Adjusts onsets for removed non-steady-state TRs and drops events that fall before time 0 after adjustment. For n-back tasks with `fix_nback_cues: true`, generic "cue" trial types are relabeled based on the n-back level of the subsequent block: 0-back cues become the bare stimulus condition (e.g., "posface", "place") because they are passive viewing events, while 2-back cues become "instruction" because they are instruction screens preceding the recall task.
-
-### Step 11: Concatenate Runs
-
-For tasks with `concatenate_runs: true` (default for non-rest tasks): concatenates BOLD files (AFNI `3dTcat`), motion regressors, and task timing (with onset adjustment for cumulative run lengths). For single-run tasks, files are copied rather than concatenated. For rest tasks (`concatenate_runs: false`): per-run files are collected as lists. Optional spatial smoothing is applied after concatenation (or per-run for rest).
-
-### Step 12: Build Config and Run First-Level Analyses
-
-Deep-copies the proc template config and overrides only subject-specific fields (paths, output directories, session-aware prefixes). Injects `global.tr` from `study.TR` if not already present (validates match if present). Injects per-analysis `fd_threshold` and `censor_prev_tr` fields; censoring is handled automatically by `fmri_first_level_proc`. The orchestrator changes the working directory to the session output directory before running AFNI to prevent `3dDeconvolve.err` file collisions between concurrent sessions. Each analysis runs independently — if one fails, others continue. First-level QC reads the upstream QC summary JSON produced by `fmri_first_level_proc` for censor statistics and other metrics. After all analyses complete, a consolidated session-level QC JSON (`orchestrator_qc.json`) is written, combining pre-analysis preprocessing metrics with per-analysis status and upstream motion metrics.
-
-### Step 13: Upload (Per-File), Sentinel, Cleanup
-
-When S3 is enabled, output files are uploaded in parallel under the per-session prefix; files already on S3 with matching size are skipped. A zero-byte `_COMPLETE` sentinel is written after verification. Local cleanup follows if `s3.cleanup_after_upload` is true (also runs on session failure).
-
-Subsequent invocations skip sessions with a `_COMPLETE` sentinel; partial uploads resume by re-uploading only missing or size-mismatched files.
-
-## Output Directory Structure
-
-```
-{output_dir}/sub-{ID}/ses-{session}A/
-├── preproc/                                              # Per-run intermediate files
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_masked.nii.gz
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_trimmed.nii.gz
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_motion.1D
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_timing.csv
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_events_fixed.tsv  (nback only)
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_csf.1D            (rest only)
-│   ├── sub-{ID}_ses-{session}A_task-{task}_run-{N}_wm.1D             (rest only)
-│   └── sub-{ID}_ses-{session}A_task-{task}_run-{N}_gs.1D             (rest only)
-│
-├── concat/                                               # Concatenated files (task only)
-│   ├── sub-{ID}_ses-{session}A_task-{task}_concat_bold.nii.gz
-│   ├── sub-{ID}_ses-{session}A_task-{task}_concat_motion.1D
-│   ├── sub-{ID}_ses-{session}A_task-{task}_concat_mask.nii.gz   (intersection of per-run masks)
-│   └── sub-{ID}_ses-{session}A_task-{task}_concat_timing.csv
-│
-├── first_level_out/                                      # Analysis outputs (uploaded to S3)
-│   ├── {analysis_name}/
-│   │   └── (analysis-specific outputs: stat buckets, beta series, etc.)
-│   └── ...
-│
-├── qc/
-│   ├── preproc/                                          # Per-run carpet plot images
-│   │   └── sub-{ID}_ses-{session}A_task-{task}_run-{N}_carpet.png
-│   └── sub-{ID}_ses-{session}A_orchestrator_qc.json      # Consolidated session QC JSON
-│
-└── sub-{ID}_ses-{session}A_first_level_config.yaml       # Generated proc config
-```
-
-The per-file S3 upload mirrors this local tree under `s3://{bucket}/{upload_prefix}/sub-{ID}/ses-{session}A/`, excluding large intermediate BOLD NIfTI files (regenerable from fMRIPrep). The `_COMPLETE` sentinel is written directly to S3 at the per-session prefix root after upload verification.
-
-Legacy `first_level_out.tar.gz` archives from prior versions are auto-migrated (see below).
-
-## Quality Control
-
-### Consolidated Session QC
-
-One JSON file per session (`sub-{ID}_ses-{session}A_orchestrator_qc.json`) combining:
-
-**Provenance block:**
-- `orchestrator_version`, `fmri_first_level_proc_version`, `afni_version`, `timestamp_utc`
-
-**Per-run preprocessing metrics (non-motion, computed by the orchestrator):**
-- **DVARS**: mean and max (from fMRIPrep confounds)
-- **tSNR**: median within-brain temporal signal-to-noise ratio (optional, via `qc.preproc.tsnr`)
-- **Brain mask**: voxel count and volume in mm^3
-- **Carpet plots**: DVARS trace above voxel-by-time heatmap (optional, via `qc.preproc.carpet_plots`); saved as PNG to `qc/preproc/`
-- **Registration quality**: Dice coefficient between functional and anatomical brain masks (optional, via `qc.preproc.registration_quality`)
-
-**Per-analysis metrics (motion and status, sourced from upstream):**
-- **completed_successfully**: whether at least one non-empty NIfTI output was produced
-- **pct_censored**: percentage of volumes censored (read from upstream QC summary JSON produced by `fmri_first_level_proc`)
-- **upstream_qc**: full upstream QC dict (censor stats, DOF, trial counts, etc.) or null if not available
-- **error**: error message if the analysis failed, else null
-- **wall_time_seconds**: analysis wall time
-
-**Session summary:**
-- **status**: qualified session status (`success`, `partial`, or `failed`)
-- **n_analyses_attempted**, **n_analyses_succeeded**, **wall_time_seconds**
-
-Motion metrics (FD, censor counts) are not computed by the orchestrator. They are sourced from the upstream `enorm.1D` and `censor.1D` files produced by `fmri_first_level_proc` and reported via the `upstream_qc` block.
-
-### Group-Level Aggregation
-
-Consolidated QC JSONs are designed for easy aggregation with pandas:
-
-```python
-import json, glob
-import pandas as pd
-
-# Consolidated session QC
-qc_files = glob.glob("*/ses-*/qc/sub-*_orchestrator_qc.json")
-sessions = [json.load(open(f)) for f in qc_files]
-
-# Key fields for exclusion decisions:
-#   analyses[name].upstream_qc.pct_censored  — censoring rate per analysis
-#   session.status                           — success / partial / failed
-```
-
-## S3 Data Structure
-
-### Source Data Patterns
-
-| Data | S3 Key Pattern |
-|------|----------------|
-| fMRIPrep archive | `{fmriprep_s3_prefix}/sub-{ID}/ses-{session}A/sub-{ID}_ses-{session}A_fmriprep-output.tar.gz` |
-| Events files | `{mmps_mproc_s3_prefix}/sub-{ID}/ses-{session}A/func/sub-{ID}_ses-{session}A_task-{task}_run-0{N}_events.tsv` |
-| Upload target (per-file) | `{upload_prefix}/sub-{ID}/ses-{session}A/{first_level_out,qc,preproc,concat}/...` |
-| Completion sentinel | `{upload_prefix}/sub-{ID}/ses-{session}A/_COMPLETE` |
-
-Session labels follow the format `ses-{code}A` where `{code}` is a session code from `s3.available_sessions` (e.g., `ses-00A`, `ses-02A`, `ses-04A`, `ses-06A`). The "A" suffix is a study convention for the ABCD dataset.
-
-### Config Fields Controlling S3 Paths
-
-- `s3.bucket` — S3 bucket name (e.g., `abcd-v6`)
-- `s3.fmriprep_s3_prefix` — prefix for fMRIPrep archives (e.g., `derivatives/fmriprep`)
-- `s3.mmps_mproc_s3_prefix` — prefix for events files (e.g., `mmps_mproc`)
-- `s3.upload_prefix` — prefix for uploading results (e.g., `derivatives/fmriprep`)
-- `s3.available_sessions` — pool of session codes to probe (e.g., `["00", "02", "04", "06"]`)
-- `s3.upload_max_workers` — number of concurrent worker threads for per-file S3 upload (default `8`, valid range `[1, 64]`, integer); boto3 S3 client is thread-safe and one client is shared across all workers
-
-### Legacy Archive Auto-Migration
-
-Legacy `first_level_out.tar.gz` archives are auto-detected and rehosted in the per-file layout on next re-touch (no reprocessing; byte-equivalent outputs preserved). The source tarball is deleted from S3 after successful migration, and a `_COMPLETE` sentinel is written to the per-session prefix.
-
-Migrated sessions carry a top-level `migration` block in the orchestrator QC JSON (source ETag, UTC timestamp, orchestrator version) for provenance auditing.
-
-## Design Decisions
-
-### Session-Centric Architecture
-
-The outer loop iterates over sessions (not tasks or processing steps). Each session is fully processed — download through upload and cleanup — before the next session begins. This minimizes peak disk usage on EC2, which is critical when processing ~11,000 subjects with multiple sessions each. Only one session's worth of fMRIPrep data needs to be on disk at any time.
-
-### Per-Analysis FD Thresholds
-
-FD thresholds are specified per analysis, not per study. This allows resting-state analyses to use stricter thresholds (e.g., 0.4 mm) while task analyses use more lenient ones (e.g., 0.9 mm). The `fd_threshold` and `censor_prev_tr` fields are injected into each analysis block of the generated config and passed to `fmri_first_level_proc`, which handles censor file generation automatically.
-
-### No Motion-Based Gating
-
-The pipeline always attempts first-level analysis for every subject, regardless of motion severity. No subjects are automatically excluded. Motion-based exclusion is a post-hoc research decision made at the group level using the QC metrics (particularly `analyses.{name}.upstream_qc.pct_censored` and `session.status` from the consolidated session QC JSON).
-
-### Deep-Copy Proc Template
-
-The first-level config is built by deep-copying the proc template and overriding only subject-specific fields (paths, output directories, prefixes). All analysis-level settings (HRF model, contrasts, bandpass, etc.) are preserved verbatim. This enforces separation of concerns: the orchestrator handles data logistics while the proc template controls analysis parameters.
-
-### Partial Success Model
-
-Within a session, each analysis runs independently. If one analysis fails (e.g., AFNI error, insufficient data), other analyses for the same session continue. Across sessions, each session is processed independently — a failed session does not prevent other sessions from being processed. A subject is only marked as fully failed if all sessions fail.
-
-### Motion Data from Raw Files
-
-All motion parameters, framewise displacement (FD), and motion derivatives are sourced from raw motion.tsv files (mmps_mproc), NOT from fMRIPrep's confounds_timeseries.tsv. This is because fMRIPrep's motion parameters in the confounds file do not include motion correction information. Rotations remain in degrees in the output `.1D` file per the `fmri_first_level_proc` >= 2.5.0 input contract; FD computation and radian conversion are handled exclusively by `fmri_first_level_proc`. DVARS, tissue signals, and non-steady-state detection remain sourced from confounds (derived from the BOLD signal, unaffected by motion source).
-
-### Idempotent Outputs
-
-Every processing step checks whether its output file already exists before running. This makes the pipeline safe to re-run after a partial failure — it picks up where it left off without re-doing completed work.
-
-## Edge Case Behavior
-
-| Scenario | Behavior |
-|----------|----------|
-| Subject has only 1 session on S3 | Processes that session only; summary shows 1 success |
-| Subject has no sessions on S3 | Raises `OrchestratorError` (fatal for that subject) |
-| Missing events file for a task run | Run is skipped with a warning; other runs proceed |
-| Missing motion file for a run | Run is skipped with a warning; other runs proceed |
-| Missing confounds or mask for a run | Run is skipped with a warning; other runs proceed |
-| All runs fail for a task | Task is skipped; other tasks proceed |
-| All tasks fail for a session | Session raises `OrchestratorError`; other sessions may still succeed |
-| One analysis fails (e.g., AFNI error) | Other analyses continue; QC JSON records the error |
-| All sessions fail for a subject | Subject-level `OrchestratorError` raised; exit code 1 in batch runner |
-| Single-run task with `concatenate_runs: true` | File is copied (not concatenated) — no 3dTcat overhead |
-| >50% volumes censored | Warning from upstream; analysis still attempted |
-| Non-steady-state TRs detected | Trimmed from BOLD, confounds, and timing; onsets adjusted |
-| Events with onset < 0 after NSS trim | Events dropped with warning |
-| Generic "cue" labels in n-back events | 0-back cues relabeled with bare stimulus condition; 2-back cues relabeled as "instruction" (when `fix_nback_cues: true`) |
-| Archive extraction finds path traversal | Unsafe members skipped with warning |
-| Insufficient disk space for extraction | `OrchestratorError` raised (requires 10x archive size free) |
-| Already-existing output files | Skipped (idempotent); pipeline picks up where it left off |
-| `--session` filter for missing session | `OrchestratorError` raised |
-| Ctrl+C during batch run | In-flight analyses finish; pending jobs cancelled; summary CSV written; exit 130 |
-
-## Troubleshooting
-
-| Error Message | Likely Cause | Resolution |
-|---------------|-------------|------------|
-| `AFNI not found on PATH` | AFNI not installed or not in environment | Install AFNI and ensure it's on `PATH`; try `3dinfo -ver` |
-| `AWS credentials not found` | No valid AWS credential chain | Configure `~/.aws/credentials`, environment variables, or EC2 instance role |
-| `No sessions found on S3 for sub-{ID}` | Subject has no fMRIPrep archives on S3 | Verify subject ID; check S3 bucket/prefix in config |
-| `Config missing required section '{section}'` | YAML config is missing `study`, `tasks`, or `analyses` | Check config file against `example_orchestrator_config.yaml` |
-| `Insufficient disk space for extraction` | Less than 10x archive size free on disk | Free disk space or use smaller batch sizes |
-| `Analysis '{name}' not found in proc template` | Orchestrator analysis name doesn't match proc template | Ensure analysis `name` fields match between configs |
-| `Type mismatch for analysis '{name}'` | Analysis type differs between orchestrator and proc template configs | Align `type` fields in both configs |
-| `Column 'framewise_displacement' not found` | fMRIPrep confounds TSV missing expected column | Verify fMRIPrep output version/completeness |
-| `Missing base motion columns` | fMRIPrep confounds TSV is missing trans/rot columns | Check fMRIPrep output; may indicate corrupted confounds |
-| `No task files found for sub-{ID}` | Archive extracted but no BOLD files match task/space | Verify `study.space` matches fMRIPrep output space entity |
-| `Exit code 130` (batch runner) | Ctrl+C interruption | Normal interruption; check summary CSV for partial results |
-
-## Development Notes
-
-### File Map
+Each session directory (`{func_prefix_template}` on S3, for example `derivatives/func/sub-{ID}/ses-{NN}A/`) must contain the producer's per-file outputs:
 
 | File | Purpose |
 |------|---------|
-| `orchestrate_first_level.py` | Main per-subject pipeline: CLI, session loop, pipeline steps 0–13 |
-| `run_orchestrator.py` | Parallel batch runner: subject list parsing, ThreadPoolExecutor, progress display, summary CSV |
-| `orchestrator_utils.py` | All utility functions: S3 operations, file discovery, preprocessing, QC, config building, validation |
-| `example_orchestrator_config.yaml` | Annotated orchestrator config example for ABCD |
-| `environment.yaml` | Conda environment specification |
+| `sub-{ID}_ses-{NN}A_task-{task}_run-{RR}_space-{space}_bold.nii.gz` | Preprocessed BOLD run (defines the run) |
+| `sub-{ID}_ses-{NN}A_task-{task}_run-{RR}_space-{space}_brainmask.nii.gz` | Run brain mask |
+| `sub-{ID}_ses-{NN}A_task-{task}_run-{RR}_desc-confounds_timeseries.tsv` | Confounds: motion parameters, framewise displacement, DVARS, non-steady-state columns |
+| `sub-{ID}_ses-{NN}A_task-{task}_run-{RR}_events.tsv` | Task events (n-back runs) |
+| `sub-{ID}_ses-{NN}A_space-{space}[_res-{res}]_label-CSF_mask.nii.gz` | Session CSF mask |
+| `sub-{ID}_ses-{NN}A_space-{space}[_res-{res}]_label-WM_mask.nii.gz` | Session WM mask |
+| `_complete.json` | Producer completion manifest, written last |
 
-### `orchestrator_utils.py` Section Index
+Session directories end in `A` (`ses-00A`); the session code is the numeric part (`00`). Other producer files (reference volumes, segmentations, probability maps, GM masks) are ignored.
 
-| Section | Functions |
-|---------|-----------|
-| A: S3 Operations | `_get_s3_client`, `enumerate_upload_targets`, `check_session_complete`, `delete_session_sentinel`, `determine_session_routing`, `discover_available_sessions`, `download_session_data`, `discover_local_mmps_files`, `extract_session_archive`, `upload_session_to_s3`, `migrate_session_from_archive` |
-| B: AFNI Check | `verify_afni_installation` |
-| C: File Discovery | `discover_session_files` |
-| D: Decompression | `decompress_if_needed` |
-| E: Brain Masking | `apply_brain_mask` |
-| F: Non-Steady-State TR Handling | `detect_non_steady_state_trs`, `remove_initial_trs_bold`, `remove_initial_trs_tabular` |
-| G: Confounds Extraction | `extract_motion_regressors`, `extract_tissue_signals` |
-| H: Task Timing | `fix_nback_cue_labels`, `format_task_timing` |
-| I: Run Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing` |
-| J: Smoothing | `apply_smoothing` |
-| J2: Mask Intersection | `compute_mask_intersection` |
-| K: QC — Preprocessing | `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality`, `compute_preproc_qc`, `save_qc_json`, `compute_first_level_qc`, `consolidate_session_qc` |
-| L: Config Building | `build_first_level_config`, `write_temp_config` |
-| M: Config Validation | `load_orchestrator_config`, `validate_proc_template` |
-| N: Output Cleanup | `cleanup_local_inputs` |
+## Outputs
 
-### Function-to-Pipeline-Step Mapping
+```
+{output_dir}/sub-{ID}/ses-{NN}A/
+├── sub-{ID}_ses-{NN}A_first_level_config.yaml     rendered fmri-first-level-proc config
+├── preproc/
+│   ├── {run_prefix}_trimmed.nii.gz                only when volumes were trimmed (not uploaded)
+│   ├── {run_prefix}_motion.1D
+│   ├── {run_prefix}_csf.1D, _wm.1D, _gs.1D        when the proc config requests them
+│   ├── {run_prefix}_events_fixed.tsv              n-back runs with cue relabeling
+│   └── {run_prefix}_timing.tsv                    task runs
+├── qc/
+│   ├── sub-{ID}_ses-{NN}A_orchestrator_qc.json    consolidated session QC
+│   └── preproc/
+│       ├── sub-{ID}_{run_label}_tsnr.nii.gz
+│       └── sub-{ID}_{run_label}_carpet.png
+└── first_level_out/{analysis_name}/               fmri-first-level-proc outputs
+```
 
-| Pipeline Step | Primary Function(s) |
-|---------------|-------------------|
-| Step 0: Session discovery | `discover_available_sessions` |
-| Step 1: S3 download | `download_session_data` |
-| Step 2: Archive extraction | `extract_session_archive` |
-| Step 3: File discovery | `discover_session_files` |
-| Step 4: Decompression | `decompress_if_needed` |
-| Step 5: Brain mask | `apply_brain_mask` |
-| Step 6: Preprocessing QC | `compute_preproc_qc`, `compute_tsnr`, `generate_carpet_plot`, `compute_registration_quality` |
-| Step 7: NSS TR removal | `detect_non_steady_state_trs`, `remove_initial_trs_bold` |
-| Step 8: Motion extraction | `extract_motion_regressors` |
-| Step 9: Tissue signals | `extract_tissue_signals` |
-| Step 10: Task timing | `fix_nback_cue_labels`, `format_task_timing` |
-| Step 11: Concatenation | `concatenate_bolds`, `concatenate_tabular_files`, `concatenate_task_timing`, `compute_mask_intersection`, `apply_smoothing` |
-| Step 12: First-level analysis | `build_first_level_config`, `write_temp_config`, `compute_first_level_qc`, `consolidate_session_qc` |
-| Step 13: Upload/sentinel/cleanup | `enumerate_upload_targets`, `upload_session_to_s3`, `cleanup_local_inputs` |
+`{run_prefix}` is `sub-{ID}_ses-{NN}A_task-{task}_run-{RR}` and `{run_label}` is `ses-{NN}A_task-{task}_run-{R}` (run number without zero padding).
 
-### Internal Data Structure: `processed_files`
+The session is mirrored to `s3://{bucket}/{upload_prefix}/sub-{ID}/ses-{NN}A/`: the files each analysis reports as outputs (plus its ledger, or its timing-error and QC-summary files when it failed), everything under `qc/`, the files directly under `preproc/` except NIfTI images, and the rendered config. A zero-byte `{upload_prefix}/sub-{ID}/ses-{NN}A/_COMPLETE` object is written last. With `s3.cleanup_after_upload: true` (the default) the downloaded inputs and the local session tree are deleted afterwards.
 
-The `processed_files` dict is the central data structure passed between pipeline steps. Its schema differs by task type:
+## Session outcomes and the completion sentinel
 
-**Task (concatenated):**
+| Outcome | Exit category | `_COMPLETE` |
+|---------|---------------|-------------|
+| Every analysis succeeded or was skipped for a documented reason, and no run was excluded for an unexplained reason | `0` complete | Written |
+| No unexplained failure, and at least one analysis failed with a `ModelError` (a data-quality floor; rerunning cannot change it) | `2` known cause | Written |
+| An analysis failed with any other error, a run was excluded for an unexpected error or a rotation-unit mismatch, or the session raised an error | `1` unexplained | Not written, so the next invocation reprocesses the session |
+
+With `--skip-first-level` the sentinel is never written. A session whose sentinel exists is skipped on later invocations unless `study.force_recompute` is true, in which case the sentinel is deleted and the session is recomputed from an empty local output directory.
+
+Documented run exclusions (`events_missing`, `motion_non_finite`, `tissue_mask_empty`, `events_invalid_values`, `events_onset_out_of_range`) and documented analysis skips (`no_usable_runs`, `events_missing_conditions`) are terminal and leave the session complete. Run exclusions for `producer_fd_inconsistent` or `unexpected_error` make the session unexplained.
+
+## Quality control
+
+Each session's `qc/sub-{ID}_ses-{NN}A_orchestrator_qc.json` contains:
+
+- `provenance`: orchestrator, fmri-first-level-proc and AFNI versions, timestamp, participant, session, and the producer manifest's `written_at` and `schema_version`.
+- `preprocessing`: per run, the number of trimmed non-steady-state volumes, DVARS mean and maximum, median brain tSNR, brain-mask voxel count and volume, carpet-plot path, the producer's framewise displacement (informational; censoring uses the FD computed by fmri-first-level-proc), the rotation-unit check result, tissue-mask voxel counts, and event counts (dropped, written, conditions present).
+- `preproc_excluded_runs`: every excluded run with its reason and message.
+- `analyses`: per analysis, the status, skip reason, fmri-first-level-proc result status, a `qc_flagged` flag (fmri-first-level-proc returned a warning status), error details, graded warnings, wall time, run labels, whether the outcome is terminal, and a `qc` block with `pct_censored`, output counts and the full fmri-first-level-proc QC summary.
+- `session`: status (`success`, `partial` or `failed`), counts of attempted, succeeded, skipped and flagged analyses, `all_terminal`, peak memory, and summary flags (`preproc_excluded_runs`, `analysis_skipped`, `analysis_failed`, `upstream_warning`).
+
+No participant is excluded for motion by the orchestrator. Censoring is performed by fmri-first-level-proc at each analysis's FD threshold, and exclusion decisions are made at the group level from the QC JSON, for example:
+
 ```python
-processed_files["nback"] = {
-    "bold": "/path/to/concat_bold.nii.gz",           # str
-    "motion": "/path/to/concat_motion.1D",            # str
-    "timing": "/path/to/concat_timing.csv",           # str or None
-}
+import glob, json
+import pandas as pd
+
+rows = []
+for path in glob.glob("outputs/sub-*/ses-*A/qc/*_orchestrator_qc.json"):
+    with open(path) as f:
+        qc = json.load(f)
+    for name, a in qc["analyses"].items():
+        rows.append({
+            "sub_id": qc["provenance"]["sub_id"],
+            "session": qc["provenance"]["session"],
+            "analysis": name,
+            "status": a["status"],
+            "qc_flagged": a["qc_flagged"],
+            "pct_censored": (a["qc"] or {}).get("pct_censored"),
+        })
+qc_table = pd.DataFrame(rows)
 ```
 
-**Rest (per-run):**
-```python
-processed_files["rest"] = {
-    "bolds": ["/path/run1.nii.gz", "/path/run2.nii.gz"],     # list of str
-    "motions": ["/path/run1_motion.1D", "/path/run2_motion.1D"],
-    "csf": ["/path/run1_csf.1D", "/path/run2_csf.1D"],
-    "wm": ["/path/run1_wm.1D", "/path/run2_wm.1D"],
-    "gs": ["/path/run1_gs.1D", "/path/run2_gs.1D"],          # list or None
-}
-```
+## Design notes
 
-### Testing
+- **Session-centric processing.** Each session is downloaded, prepared, analyzed, uploaded and cleaned up before the next one starts, which bounds local disk use to one session.
+- **Proc-config authority.** Analysis settings are never injected or overridden by the orchestrator. `global.tr` must equal `study.TR`; a mismatch is an error rather than a silent correction.
+- **Rotation-unit check.** fmri-first-level-proc expects rotations in degrees. For every run the orchestrator recomputes Power framewise displacement (Power et al., 2012) from the six motion parameters with rotations taken as degrees on a 50 mm sphere and compares it with the producer's `framewise_displacement` column (absolute tolerance 1e-6 mm). A degree/radian mismatch changes FD by orders of magnitude more than the tolerance, so a disagreement excludes the run and marks the session unexplained.
+- **Event timing.** Onsets are shifted by the trimmed duration. Events whose shifted onset is negative are dropped, including events that straddle the cutoff, because a clipped event would be modeled late and would shorten its condition's mean duration.
+- **Strict inputs.** A session without a completion manifest is skipped; a manifest that lists missing files, or a session lacking required masks, stops the participant with an error that lists every missing item. With `--session`, only that session's manifest is read.
+- **Verified per-file upload.** Only missing or size-mismatched files are uploaded, every expected key is verified afterwards, stale keys under the session prefix are deleted, and the sentinel is written last.
+- **S3 only.** Inputs are listed and downloaded from S3, each session is recomputed from an empty local output directory, and outputs are uploaded back to S3; `study.input_dir` and `study.output_dir` are local working directories.
 
-The `tests/` directory contains pytest test suites for validating orchestrator utility functions. Run with:
+## Troubleshooting
 
-```bash
-python -m pytest tests/ -v
-```
+| Message | Likely cause | Resolution |
+|---------|--------------|------------|
+| `fmri_first_level_proc ... requires >= 4.0.0` or `requires < 5.0.0` | Wrong upstream version | Recreate the environment from `environment.yaml` |
+| `AFNI preflight failed` or `AFNI version check failed` | AFNI missing from `PATH` or older than the upstream minimum | Install or update AFNI |
+| `AWS credentials not found` | No credential source available | Configure AWS credentials for the account that holds the bucket |
+| `No sessions discovered for sub-{ID}` | Wrong ID or prefix template, or no session has a completion manifest yet | Check `s3.func_prefix_template` and the participant's S3 listing; sessions without `_complete.json` are skipped |
+| `_complete.json lists file(s) absent from the listing` | Producer output for that session is incomplete | Regenerate or repair the session's producer outputs |
+| `Subject input-completeness gate failed: ...` | Brain mask, confounds or a required tissue mask is missing | The message lists every missing item |
+| `global.tr in proc template (...) does not match study.TR (...)` | The two configs disagree | Make the values equal |
+| `Orchestrator analysis '{name}' has no matching entry in proc template` or `Type mismatch for analysis '{name}'` | Analysis names or types differ between the configs | Align `name` and `type` |
+| `Stale sentinel present at upload start` | A `_COMPLETE` object appeared under the session prefix while the session was being processed | Ensure only one process handles a participant at a time, then rerun |
+| `Post-upload verification failed` | Keys missing or size-mismatched after upload | Rerun; only the gap is uploaded |
+| Run excluded with reason `producer_fd_inconsistent` | Producer rotations are not in degrees, or its FD is computed differently | Inspect that run's confounds file |
 
-Test outputs are written to a sandbox directory and cleaned up after each test run.
+## Repository contents
+
+| File | Purpose |
+|------|---------|
+| `orchestrate_first_level.py` | Per-participant entry point: command line, session loop, run preparation, analysis dispatch, QC, upload |
+| `orchestrator_utils.py` | Discovery, download, run preparation, QC, config building and validation, outcome classification, S3 upload |
+| `run_orchestrator.py` | Parallel batch runner with progress display and summary CSV |
+| `example_orchestrator_config.yaml` | Example orchestrator config (placeholder paths and bucket) |
+| `example_proc_config.yaml` | Example fmri-first-level-proc template config (placeholder atlas path) |
+| `environment.yaml` | Conda environment |
+| `INPUT_SPECIFICATION.md` | Complete input, validation and output reference |
+| `LICENSE` | MIT license |
+
+## References
+
+- Casey, B. J., et al. (2018). The Adolescent Brain Cognitive Development (ABCD) study: Imaging acquisition across 21 sites. *Developmental Cognitive Neuroscience*, 32, 43-54.
+- Cox, R. W. (1996). AFNI: Software for analysis and visualization of functional magnetic resonance neuroimages. *Computers and Biomedical Research*, 29(3), 162-173.
+- Power, J. D., Barnes, K. A., Snyder, A. Z., Schlaggar, B. L., & Petersen, S. E. (2012). Spurious but systematic correlations in functional connectivity MRI networks arise from subject motion. *NeuroImage*, 59(3), 2142-2154.
+- Schaefer, A., et al. (2018). Local-global parcellation of the human cerebral cortex from intrinsic functional connectivity MRI. *Cerebral Cortex*, 28(9), 3095-3114.
+- Tian, Y., Margulies, D. S., Breakspear, M., & Zalesky, A. (2020). Topographic organization of the human subcortex unveiled with functional connectivity gradients. *Nature Neuroscience*, 23(11), 1421-1432.
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE).
 
 ## Author
 
